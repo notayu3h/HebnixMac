@@ -63,6 +63,10 @@ impl Default for WindowCfg {
 pub struct SettingsCfg {
     pub hotkey: String,
     pub theme: String,
+    /// macOS only: force "Rocket League running" if auto-detection fails.
+    #[cfg(target_os = "macos")]
+    #[serde(default)]
+    pub force_rl_running: bool,
     /// UI language code ("en", "de", ...) or "auto" to follow the system
     pub language: String,
     /// Main tab selected when Hebnix starts.
@@ -122,6 +126,8 @@ impl Default for SettingsCfg {
         Self {
             hotkey: "f2".to_string(),
             theme: "Dark".to_string(),
+            #[cfg(target_os = "macos")]
+            force_rl_running: false,
             language: crate::i18n::AUTO.to_string(),
             default_tab: "Home".to_string(),
             home_default_migrated: true,

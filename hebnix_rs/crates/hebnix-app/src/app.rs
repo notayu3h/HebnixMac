@@ -988,6 +988,8 @@ impl HebnixApp {
                 rl_path: config.settings.rl_path.clone(),
                 #[cfg(any(target_os = "linux", target_os = "macos"))]
                 rl_launch: config.rl_launch.clone(),
+                #[cfg(target_os = "macos")]
+                force_rl_running: config.settings.force_rl_running,
             },
             tx.clone(),
             cc.egui_ctx.clone(),
@@ -3830,6 +3832,8 @@ impl HebnixApp {
             rl_path: self.config.settings.rl_path.clone(),
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             rl_launch: self.config.rl_launch.clone(),
+            #[cfg(target_os = "macos")]
+            force_rl_running: self.config.settings.force_rl_running,
         });
     }
 
@@ -5129,6 +5133,34 @@ impl HebnixApp {
             ui.label(egui::RichText::new(status).size(11.0).color(egui::Color32::GRAY));
         }
         ui.add_space(6.0);
+
+        ui.separator();
+        ui.label("Game detection");
+        ui.horizontal(|ui| {
+            if ui
+                .checkbox(
+                    &mut self.config.settings.force_rl_running,
+                    "Force: Rocket League is running",
+                )
+                .changed()
+            {
+                self.save_config();
+                self.monitor.update_shared(crate::monitor::MonitorShared {
+                    api_port: self.current_api_port,
+                    statsapi_path: self.config.settings.statsapi_path.clone(),
+                    rl_path: self.config.settings.rl_path.clone(),
+                    #[cfg(any(target_os = "linux", target_os = "macos"))]
+                    rl_launch: self.config.rl_launch.clone(),
+                    #[cfg(target_os = "macos")]
+                    force_rl_running: self.config.settings.force_rl_running,
+                });
+            }
+        });
+        ui.label(
+            egui::RichText::new("Only enable if the game is open but Hebnix still says it is not detected. Turn it off when done.")
+                .size(11.0)
+                .color(egui::Color32::GRAY),
+        );
     }
 
     fn render_hebnix_settings(&mut self, ui: &mut egui::Ui) {
