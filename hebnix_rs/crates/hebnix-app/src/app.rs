@@ -750,6 +750,10 @@ pub struct HebnixApp {
     celebration: crate::patcher::celebration::State,
     bots_freeplay: crate::patcher::bots_freeplay::State,
     delete_backups: crate::patcher::delete_backups::State,
+    #[cfg(target_os = "macos")]
+    confirm_restore_game: bool,
+    #[cfg(target_os = "macos")]
+    restore_game_status: Option<String>,
     chat_export: crate::patcher::chat_export::State,
     lan_commands: crate::patcher::lan_commands::State,
     chat_paste: crate::patcher::chat_paste::State,
@@ -1391,6 +1395,10 @@ impl HebnixApp {
             celebration: Default::default(),
             bots_freeplay: Default::default(),
             delete_backups: Default::default(),
+            #[cfg(target_os = "macos")]
+            confirm_restore_game: false,
+            #[cfg(target_os = "macos")]
+            restore_game_status: None,
             chat_export: Default::default(),
             lan_commands: Default::default(),
             chat_paste: Default::default(),
@@ -5049,6 +5057,80 @@ impl HebnixApp {
         self.render_hebnix_settings(ui);
     }
 
+    /// macOS: reset actions. "Restore all item swaps" uses the existing
+    /// swapper manifest; "Restore all game files" runs the comprehensive
+    /// uninstall/restore pass. Both are confirmation-gated.
+    #[cfg(target_os = "macos")]
+    fn render_restore_controls(&mut self, ui: &mut egui::Ui, cooked_pc: &std::path::Path) {
+        ui.separator();
+        ui.heading("Restore original files");
+        ui.label(
+            egui::RichText::new("Undo changes Hebnix made to your game files. Close Rocket League first.")
+                .size(11.0)
+                .color(egui::Color32::GRAY),
+        );
+        ui.add_space(6.0);
+
+        // 1) Item swaps only (manifest of active swaps).
+        let backups = cooked_pc.join("Backups");
+        let active = self.swapper.active_count(&backups);
+        if ui
+            .add_enabled(
+                active > 0,
+                egui::Button::new(format!("Restore all item swaps ({active})")),
+            )
+            .clicked()
+        {
+            match self.swapper.restore_all_active(cooked_pc, &backups, &self.tx) {
+                Ok(n) => {
+                    self.restore_game_status = Some(format!("Restored {n} item swaps."));
+                    self.console.write(format!("[Items] Restored {n} item swaps."));
+                }
+                Err(e) => self.restore_game_status = Some(format!("Restore failed: {e}")),
+            }
+        }
+
+        // 2) Everything (full restore pass).
+        if !self.confirm_restore_game {
+            if ui.button("Restore ALL game files to original").clicked() {
+                self.confirm_restore_game = true;
+            }
+        } else {
+            ui.horizontal(|ui| {
+                ui.colored_label(
+                    egui::Color32::from_rgb(0xE0, 0xA6, 0x4B),
+                    "Restore every game file Hebnix changed?",
+                );
+                if ui.button("Confirm").clicked() {
+                    self.confirm_restore_game = false;
+                    let base = self.base_dir.clone();
+                    let game = std::path::PathBuf::from(&self.config.settings.rl_path);
+                    let tx = self.tx.clone();
+                    let ctx = ui.ctx().clone();
+                    std::thread::spawn(move || {
+                        let result = crate::patcher::uninstall::restore(&base, &game);
+                        let msg = match result {
+                            Ok(()) => "All game files restored to original.".to_string(),
+                            Err(e) => format!("Restore failed: {e}"),
+                        };
+                        let _ = tx.send(AppMsg::Log(msg.clone()));
+                        ctx.request_repaint();
+                    });
+                    self.restore_game_status = Some("Restoring game files...".into());
+                }
+                if ui.button("Cancel").clicked() {
+                    self.confirm_restore_game = false;
+                }
+            });
+        }
+
+        if let Some(status) = &self.restore_game_status {
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new(status).size(11.0).color(egui::Color32::GRAY));
+        }
+        ui.add_space(6.0);
+    }
+
     fn render_hebnix_settings(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
 
@@ -5814,6 +5896,8 @@ impl HebnixApp {
                                 HebnixSettingsTab::System => {
                                     let cooked_pc = PathBuf::from(&self.config.settings.rl_path).join("TAGame").join("CookedPCConsole");
                                     self.delete_backups.render(ui, &cooked_pc);
+                                    #[cfg(target_os = "macos")]
+                                    self.render_restore_controls(ui, &cooked_pc);
                                     ui.add_space(16.0);
                                     let label_w = label_column_width(
                                         ui,

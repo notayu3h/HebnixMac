@@ -94,6 +94,8 @@ mod patch_core {
     pub use crate::patcher::patch_core::*;
 }
 mod plugins;
+#[cfg(target_os = "macos")]
+mod release_version;
 mod presets;
 mod profile_pictures;
 #[cfg(target_os = "windows")]
