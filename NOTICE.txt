@@ -1,0 +1,9 @@
+Hebnix
+Copyright 2026 @nixvio64 and @hebbins
+
+This product includes software developed for the Hebnix project
+(https://github.com/HebnixRL/Hebnix-Public).
+
+HebnixMac is a macOS fork of Hebnix, modified from Hebnix 2.3.2
+(https://github.com/HebnixRL/Hebnix-Public) by @nixvio64 and @hebbins.
+It is unofficial and not affiliated with or endorsed by the Hebnix project.

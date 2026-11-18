@@ -1,0 +1,8 @@
+# build artifacts
+build/
+hebnix_rs/target/
+hebnix_rs/dist/
+.DS_Store
+*.log
+hebnix.log
+crash.txt
