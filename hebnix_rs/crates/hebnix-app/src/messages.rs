@@ -168,6 +168,10 @@ pub enum AppMsg {
     AppUpdateFetched {
         result: Result<Option<crate::update::UpdateInfo>, String>,
     },
+    #[cfg(target_os = "macos")]
+    GithubUpdateFetched {
+        result: Result<Option<(String, String)>, String>,
+    },
     ChangelogFetched {
         result: Result<Option<crate::update::ChangelogEntry>, String>,
     },

@@ -2,6 +2,45 @@ use serde_json::Value;
 use std::path::Path;
 use std::time::Duration;
 
+/// GitHub releases feed for the macOS fork (not upstream hebnix.com).
+#[cfg(target_os = "macos")]
+const GITHUB_RELEASES_LATEST: &str =
+    "https://api.github.com/repos/notayu3h/HebnixMac/releases/latest";
+/// macOS fork release version, matching the GitHub tag (the crate version is
+/// inherited from upstream and intentionally differs).
+#[cfg(target_os = "macos")]
+const VERSION: &str = "1.0.0";
+
+/// Latest GitHub release for the macOS fork: (tag, download URL), if newer.
+#[cfg(target_os = "macos")]
+pub fn fetch_github_release() -> Result<Option<(String, String)>, String> {
+    let agent = ureq::AgentBuilder::new()
+        .try_proxy_from_env(false)
+        .build();
+    let resp = agent
+        .get(GITHUB_RELEASES_LATEST)
+        .set("User-Agent", "HebnixMac")
+        .set("Accept", "application/vnd.github+json")
+        .timeout(Duration::from_secs(10))
+        .call()
+        .map_err(|e| format!("Network error while checking for updates: {e}"))?;
+    let json: Value = resp
+        .into_json()
+        .map_err(|e| format!("Invalid JSON response: {e}"))?;
+    let tag = json.get("tag_name").and_then(Value::as_str).unwrap_or("").trim_start_matches('v').to_string();
+    let url = json
+        .get("assets")
+        .and_then(Value::as_array)
+        .and_then(|a| a.iter().find(|x| x.get("name").and_then(Value::as_str) == Some("HebnixMac.dmg")))
+        .and_then(|x| x.get("browser_download_url").and_then(Value::as_str))
+        .unwrap_or("")
+        .to_string();
+    if url.is_empty() || !is_newer_version(VERSION, &tag) {
+        return Ok(None);
+    }
+    Ok(Some((tag, url)))
+}
+
 const INFO_URL: &str = "https://api.hebnix.com/info";
 
 #[derive(Debug, Clone)]

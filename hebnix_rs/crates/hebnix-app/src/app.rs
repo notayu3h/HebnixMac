@@ -680,6 +680,10 @@ pub struct HebnixApp {
     plugin_monitor_size: (f32, f32),
     plugin_monitor_checked: Option<std::time::Instant>,
     update_info: Option<crate::update::UpdateInfo>,
+    #[cfg(target_os = "macos")]
+    github_update: Option<(String, String)>,
+    #[cfg(target_os = "macos")]
+    github_update_dismissed: bool,
     update_downloading: bool,
     #[cfg(target_os = "linux")]
     appimage_update: Option<crate::update::AppImageBanner>,
@@ -892,14 +896,25 @@ impl HebnixApp {
         }
         let tx_update = tx.clone();
         let ctx_update = cc.egui_ctx.clone();
+        // On macOS check our own GitHub releases; upstream's feed offers a
+        // different app and is intentionally not queried.
+        #[cfg(target_os = "macos")]
+        {
+            let tx = tx_update.clone();
+            let ctx = ctx_update.clone();
+            std::thread::Builder::new()
+                .name("github-update-checker".into())
+                .spawn(move || {
+                    let result = crate::update::fetch_github_release();
+                    let _ = tx.send(AppMsg::GithubUpdateFetched { result });
+                    ctx.request_repaint();
+                })
+                .ok();
+        }
+        #[cfg(not(target_os = "macos"))]
         std::thread::Builder::new()
             .name("update-checker".into())
             .spawn(move || {
-                // The macOS build is a fork with no update feed of its own, and
-                // asking upstream would offer a build that is not this app.
-                if cfg!(target_os = "macos") {
-                    return;
-                }
                 if let Ok(info) = crate::update::fetch_info(APP_VERSION, false) {
                     let _ = tx_update.send(AppMsg::AppUpdateFetched {
                         result: Ok(info.update),
@@ -1308,6 +1323,10 @@ impl HebnixApp {
             plugin_monitor_size: (1920.0, 1080.0),
             plugin_monitor_checked: None,
             update_info: None,
+            #[cfg(target_os = "macos")]
+            github_update: None,
+            #[cfg(target_os = "macos")]
+            github_update_dismissed: false,
             update_downloading: false,
             #[cfg(target_os = "linux")]
             appimage_update: None,
@@ -2888,6 +2907,16 @@ impl HebnixApp {
                     }
                     self.workshop.tick_shutdown_grace();
                 }
+                #[cfg(target_os = "macos")]
+                AppMsg::GithubUpdateFetched { result } => match result {
+                    Ok(Some((version, url))) => {
+                        self.github_update = Some((version, url));
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        tracing::warn!("GitHub update check failed: {err}");
+                    }
+                },
                 AppMsg::AppUpdateFetched { result } => match result {
                     Ok(Some(info)) => {
                         self.console
@@ -6754,6 +6783,46 @@ impl HebnixApp {
         }
     }
 
+    /// Dismissible "new version available" popup for the macOS fork, sourced
+    /// from its own GitHub releases (not the upstream hebnix.com feed).
+    #[cfg(target_os = "macos")]
+    fn render_github_update_popup(&mut self, ctx: &egui::Context) {
+        if self.github_update_dismissed {
+            return;
+        }
+        let Some((version, url)) = self.github_update.clone() else {
+            return;
+        };
+        let mut open = true;
+        let mut download = false;
+        egui::Window::new("Update available")
+            .id(egui::Id::new("github_update_window"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.heading(format!("HebnixMac v{version} is available"));
+                ui.label("A new version has been released on GitHub. You can download it, or dismiss this and continue.");
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Download update").clicked() {
+                        download = true;
+                    }
+                    if ui.button("Later").clicked() {
+                        self.github_update_dismissed = true;
+                    }
+                });
+            });
+        if !open {
+            self.github_update_dismissed = true;
+        }
+        if download {
+            let _ = open::that(&url);
+            self.github_update_dismissed = true;
+        }
+    }
+
     fn render_changelog_popup(&mut self, ctx: &egui::Context) {
         let Some(entry) = self.changelog_popup.clone() else {
             return;
@@ -8111,6 +8180,8 @@ impl eframe::App for HebnixApp {
         }
 
         if !self.hidden {
+            #[cfg(target_os = "macos")]
+            self.render_github_update_popup(ctx);
             self.render_item_clear_prompt(ctx);
             self.render_admin_prompt(ctx);
             self.render_item_action_prompt(ctx);
