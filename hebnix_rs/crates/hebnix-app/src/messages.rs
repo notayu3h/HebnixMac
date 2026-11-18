@@ -1,0 +1,209 @@
+use crossbeam_channel::Sender;
+use hebnix_sdk::save_file::WindowMode;
+use hebnix_sdk::stats::StatsEvent;
+use serde_json::Value;
+
+pub fn block_item_action_if_game_running(tx: &Sender<AppMsg>) -> bool {
+    if hebnix_sdk::process::is_rocket_league_running() {
+        let _ = tx.send(AppMsg::ItemActionBlocked);
+        true
+    } else {
+        false
+    }
+}
+
+#[derive(Debug)]
+pub enum AppMsg {
+    NotificationFetched(crate::notifications::Notification),
+    Log(String),
+    SpooferCertificateLost,
+    RlApiCaptureReady(Result<(), String>),
+    RlApiResponse(Result<Value, String>),
+    ReplayUploadFinished(crate::auto_upload_replays::UploadResult),
+    GameEvent(StatsEvent),
+    // periodic RL monitor result. root_dir is the game install folder resolved
+    // from the running process, used to auto-fill the configured paths.
+    RlStatus {
+        rl_open: bool,
+        api_open: bool,
+        root_dir: Option<String>,
+    },
+    // monitor set PacketSendRate, game needs a restart
+    StatsApiInitialised,
+    // only sent when it changes
+    WindowMode(WindowMode),
+    ToggleVisibility,
+    TrayToggleVisibility,
+    // controller chord: open or close the docked side panel
+    TogglePanel,
+    TrayQuit,
+    HotkeyCaptured(Option<String>),
+    // should the main window be topmost (RL or hebnix focused)
+    Topmost(bool),
+    ItemActionBlocked,
+    ReloadCatalogs,
+    CatalogsFetched {
+        result: Result<std::collections::HashMap<String, Value>, String>,
+    },
+    WorkshopCatalog(Result<Vec<Value>, String>),
+    WorkshopImage {
+        key: String,
+        bytes: Vec<u8>,
+    },
+    WorkshopOpDone {
+        message: String,
+    },
+    BackgroundChangerDone(Result<String, String>),
+    MenuMapDone(Result<String, String>),
+    BackgroundChangerProgress(String),
+    // result of starting the multiplayer sidecar and its first announce
+    WorkshopTailnetStarted {
+        result: Result<std::sync::Arc<crate::multiplayer_lan::TailcatSidecarHandle>, String>,
+    },
+    // fires whether this peer ended up hosting or joining inside Rocket
+    // League - the relay itself doesn't care which, see hosting.rs
+    WorkshopRelayStarted {
+        result: Result<crate::multiplayer_lan::HostSession, String>,
+    },
+    WorkshopPlayerUpdated {
+        result: Result<(), String>,
+    },
+    WorkshopHostSessionCheck {
+        result: Result<crate::multiplayer_lan::Room, String>,
+    },
+    WorkshopLaunchCheck {
+        rl_open: bool,
+        launch_ready: bool,
+    },
+    // "install from hebnix" plugin metadata fetch done
+    PluginFetch {
+        result: Result<Value, String>,
+    },
+    PluginImage {
+        key: String,
+        bytes: Vec<u8>,
+    },
+    PluginDownloadDone {
+        result: Result<(String, String), String>,
+    },
+    ThemeInstallDone {
+        result: Result<(String, String), String>,
+    },
+    // hebnix.toast from a plugin
+    Toast {
+        slug: String,
+        name: String,
+        text: String,
+        style: crate::toast::ToastStyle,
+    },
+    // file work with a bar, see toast::report
+    Progress {
+        key: String,
+        text: String,
+        fraction: Option<f32>,
+        done: bool,
+        failed: bool,
+    },
+    // http result, slug picks the plugin that asked
+    PluginHttpRes {
+        slug: String,
+        req_id: String,
+        status: u16,
+        body: String,
+    },
+    // byte-safe variant of PluginHttpRes for http_download_async body is
+    // raw bytes, not decoded as UTF-8 text, so binary responses (e.g.
+    // avatar images) survive intact.
+    PluginHttpDownloadRes {
+        slug: String,
+        req_id: String,
+        status: u16,
+        body: Vec<u8>,
+    },
+    // result of http_get_no_redirect_async location is the response's
+    // Location header (empty if none/not a redirect). Used for OAuth flows
+    // that put their payload in a 302's Location header (e.g. PSN's NPSSO
+    // exchange) instead of a followable body.
+    PluginHttpRedirectRes {
+        slug: String,
+        req_id: String,
+        status: u16,
+        location: String,
+    },
+    // result of http_multipart_post_async, lands in on_http_upload_response
+    PluginHttpUploadRes {
+        slug: String,
+        req_id: String,
+        status: u16,
+        body: String,
+    },
+    // result of import_asset_async, lands in on_asset_imported
+    PluginAssetImported {
+        slug: String,
+        req_id: String,
+        name: Option<String>,
+        error: Option<String>,
+    },
+    PluginHttpResult {
+        slug: String,
+        req_id: String,
+        status: u16,
+        body: Vec<u8>,
+        headers: String,
+    },
+    PluginWsOpen {
+        slug: String,
+        id: String,
+    },
+    PluginWsMessage {
+        slug: String,
+        id: String,
+        data: String,
+    },
+    PluginWsClose {
+        slug: String,
+        id: String,
+        reason: String,
+    },
+    AppUpdateFetched {
+        result: Result<Option<crate::update::UpdateInfo>, String>,
+    },
+    ChangelogFetched {
+        result: Result<Option<crate::update::ChangelogEntry>, String>,
+    },
+    AppUpdateReady {
+        staged: std::path::PathBuf,
+    },
+    MaintenanceFinished {
+        result: Result<(), String>,
+    },
+    AppUpdateFailed {
+        error: String,
+    },
+    #[cfg(target_os = "linux")]
+    AppImageUpdateDone {
+        result: Result<(), String>,
+    },
+    PluginUpdatesFound {
+        updates: Result<Vec<Value>, String>,
+    },
+    PluginAutoUpdateDone {
+        slug: String,
+        was_enabled: bool,
+        result: Result<String, String>,
+    },
+    SendWsCommand(hebnix_sdk::stats::websocket::WsCommand),
+    // another player turned Workshop multiplayer on or off
+    TailcatPeer {
+        id: String,
+        name: String,
+        online: bool,
+    },
+    // every few seconds from the multiplayer sidecar: every other player's
+    // connection path and ping
+    TailcatStatus {
+        peers: Vec<crate::multiplayer_lan::PeerLink>,
+    },
+    // the multiplayer sidecar exited (crash, or stopped)
+    TailcatExited,
+}

@@ -1,0 +1,113 @@
+[package]
+name = "hebnix-app"
+version = "2.3.2"
+edition = "2024"
+
+[features]
+default = []
+lite = []
+
+[[bin]]
+name = "hebnix"
+path = "src/main.rs"
+
+[[bin]]
+name = "hebnix-lite"
+path = "src/lite_main.rs"
+required-features = ["lite"]
+
+[dependencies]
+aes = "0.8"
+crc32fast = "1"
+crossbeam-channel.workspace = true
+dirs = "6.0.0"
+encoding_rs = "0.8"
+egui_extras = { version = "0.35.0", features = ["image", "svg", "gif"] }
+hebnix-sdk = { version = "2.3.2", path = "../hebnix-sdk" }
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "ico", "bmp", "webp", "gif"] }
+# zune-jpeg 0.5.15 corrupts non-interleaved baseline JPEG banners (#419).
+jpeg-decoder = { version = "0.3.2", default-features = false }
+bcdec_rs = "0.1"
+mlua = { version = "0.11.6", features = ["lua54", "vendored", "serialize"] }
+httparse = "1"
+url = "2"
+open = "5.3.6"
+rand = "0.8"
+rcgen = { version = "0.14", features = ["x509-parser"] }
+raw-window-handle = "0.6.2"
+rfd = "0.17.2"
+rsa = "0.9"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rust-ini = "0.21.3"
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true
+toml = "1.1.2"
+time = { version = "0.3.55", features = ["local-offset"] }
+tracing.workspace = true
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+tray-icon = "0.24.1"
+ureq = { workspace = true, features = ["json"] }
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+reqwest = { version = "0.11", features = ["blocking", "multipart"] }
+base64 = "0.21"
+flate2 = "1.0"
+hmac = "0.12"
+sha2 = "0.10"
+socket2 = "0.5"
+hex = "0.4"
+gamepads = "0.1"
+rodio = "0.17"
+tungstenite = { version = "0.21", features = ["native-tls"] }
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8", "std"] }
+fluent-bundle = "0.16.0"
+unic-langid = "0.9.6"
+sys-locale = "0.3.2"
+sysinfo = "0.38.4"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+eframe = "0.35.0"
+webview2-com = "0.39.1"
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Graphics_Direct2D", "Win32_Graphics_Direct2D_Common", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D11", "Win32_Graphics_DirectComposition", "Win32_Graphics_Dxgi", "Win32_Graphics_DirectWrite", "Win32_Storage_Xps", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_Diagnostics_Debug", "Win32_System_Diagnostics_ToolHelp", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_Networking_WinInet", "Win32_Storage_FileSystem", "Win32_NetworkManagement_Dns", "Foundation", "Graphics", "Graphics_Capture", "Graphics_DirectX", "Graphics_DirectX_Direct3D11", "Security_Authorization_AppCapabilityAccess", "Win32_Graphics_Dwm", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Gdi", "Win32_System_WinRT", "Win32_System_WinRT_Direct3D11", "Win32_System_WinRT_Graphics_Capture", "Media_Control", "Storage_Streams"] }
+windows-numerics = "0.3.1"
+winreg = "0.56.0"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# egui is the whole UI; on macOS it renders through glow like Linux does.
+eframe = { version = "0.35.0", default-features = false, features = ["default_fonts", "glow"] }
+# libc is portable; only the Linux block declared it before.
+libc = "0.2"
+# WKWebView overlay messages AppKit/WebKit through the objc2 runtime.
+objc2 = "0.5.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+eframe = { version = "0.35.0", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+nix = { version = "0.29", features = ["process", "signal", "fs", "user", "poll"] }
+libc = "0.2"
+caps = "0.5"
+shell-words = "1"
+evdev = "0.13"
+gilrs = "0.11"
+smithay-client-toolkit = { version = "0.19", default-features = false, features = ["calloop"] }
+wayland-client = "0.31"
+wayland-backend = { version = "0.3", features = ["log"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+tiny-skia = "0.11"
+x11rb = { version = "0.13", features = ["shape", "shm"] }
+ab_glyph = "0.2"
+cairo = { version = "=0.18.5", package = "cairo-rs" }
+gdk = "0.18.2"
+gtk = "0.18"
+gio = "0.18"
+glib = "0.18"
+gtk-layer-shell = { version = "0.8.2", features = ["v0_6"] }
+webkit2gtk = { version = "2.0.2", features = ["v2_40"] }
+javascriptcore-rs = "1.1.2"
+
+# Only build.rs's Windows version-resource/manifest embedding uses these.
+[target.'cfg(target_os = "windows")'.build-dependencies]
+embed-manifest = "1.5.0"
+embed-resource = "3.0.6"
+
+[dev-dependencies]
+fluent-syntax = "0.12.0"

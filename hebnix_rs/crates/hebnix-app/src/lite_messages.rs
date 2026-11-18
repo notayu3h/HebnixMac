@@ -1,0 +1,126 @@
+use hebnix_sdk::save_file::WindowMode;
+use hebnix_sdk::stats::{StatsEvent, websocket::WsCommand};
+use serde_json::Value;
+
+#[derive(Debug)]
+pub enum AppMsg {
+    NotificationFetched(crate::notifications::Notification),
+    Log(String),
+    GameEvent(StatsEvent),
+    RlStatus {
+        rl_open: bool,
+        api_open: bool,
+        root_dir: Option<String>,
+    },
+    StatsApiInitialised,
+    WindowMode(WindowMode),
+    ToggleVisibility,
+    TrayToggleVisibility,
+    TrayQuit,
+    HotkeyCaptured(Option<String>),
+    Topmost(bool),
+    Toast {
+        slug: String,
+        name: String,
+        text: String,
+        style: crate::toast::ToastStyle,
+    },
+    // file work with a bar, see toast::report
+    Progress {
+        key: String,
+        text: String,
+        fraction: Option<f32>,
+        done: bool,
+        failed: bool,
+    },
+    PluginHttpRes {
+        slug: String,
+        req_id: String,
+        status: u16,
+        body: String,
+    },
+    PluginHttpDownloadRes {
+        slug: String,
+        req_id: String,
+        status: u16,
+        body: Vec<u8>,
+    },
+    PluginHttpRedirectRes {
+        slug: String,
+        req_id: String,
+        status: u16,
+        location: String,
+    },
+    // result of http_multipart_post_async, lands in on_http_upload_response
+    PluginHttpUploadRes {
+        slug: String,
+        req_id: String,
+        status: u16,
+        body: String,
+    },
+    // result of import_asset_async, lands in on_asset_imported
+    PluginAssetImported {
+        slug: String,
+        req_id: String,
+        name: Option<String>,
+        error: Option<String>,
+    },
+    PluginHttpResult {
+        slug: String,
+        req_id: String,
+        status: u16,
+        body: Vec<u8>,
+        headers: String,
+    },
+    PluginWsOpen {
+        slug: String,
+        id: String,
+    },
+    PluginWsMessage {
+        slug: String,
+        id: String,
+        data: String,
+    },
+    PluginWsClose {
+        slug: String,
+        id: String,
+        reason: String,
+    },
+    PluginFetch {
+        result: Result<Value, String>,
+    },
+    PluginImage {
+        key: String,
+        bytes: Vec<u8>,
+    },
+    PluginDownloadDone {
+        result: Result<(String, String), String>,
+    },
+    ThemeInstallDone {
+        result: Result<(String, String), String>,
+    },
+    AppUpdateFetched {
+        result: Result<Option<crate::update::UpdateInfo>, String>,
+    },
+    ChangelogFetched {
+        result: Result<Option<crate::update::ChangelogEntry>, String>,
+    },
+    AppUpdateReady {
+        staged: std::path::PathBuf,
+    },
+    MaintenanceFinished {
+        result: Result<(), String>,
+    },
+    AppUpdateFailed {
+        error: String,
+    },
+    PluginUpdatesFound {
+        updates: Result<Vec<Value>, String>,
+    },
+    PluginAutoUpdateDone {
+        slug: String,
+        was_enabled: bool,
+        result: Result<String, String>,
+    },
+    SendWsCommand(WsCommand),
+}

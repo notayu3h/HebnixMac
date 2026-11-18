@@ -1,0 +1,1093 @@
+use crate::config::{Config, PatchSource};
+use crate::i18n::{t, t_args};
+use crate::messages::AppMsg;
+use crate::patcher::catalog::PatchCatalog;
+use crate::patcher::patch_source_selector;
+use crossbeam_channel::{Receiver, Sender};
+use eframe::egui;
+use serde::Deserialize;
+use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+fn is_ball_backup(name: &str) -> bool {
+    name.strip_suffix(".bak")
+        .is_some_and(crate::patcher::patch_core::gameinfo::is_ball_upk)
+        || crate::patcher::patch_core::standard_ball::is_ball_tfc_backup(name)
+        || matches!(
+            name,
+            "Textures2.tfc_3164923583.bin"
+                | "Textures2.tfc_3165101623.bin"
+                | "Textures2.tfc_3165152057.bin"
+                | "Textures2.tfc_3165166143.bin"
+        )
+}
+
+#[cfg(test)]
+mod deletion_tests {
+    use super::*;
+
+    struct Fixture(PathBuf);
+
+    impl Fixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "hebnix-ball-delete-{:032x}",
+                rand::random::<u128>()
+            ));
+            fs::create_dir_all(root.join("balls/pack")).unwrap();
+            fs::write(root.join("balls/pack/texture.png"), b"texture").unwrap();
+            fs::write(
+                root.join("balls/pack/balls.json"),
+                r#"{
+                "First": {"Params": {"Diffuse": "texture.png"}},
+                "Second": {"Params": {"Diffuse": "texture.png"}}
+            }"#,
+            )
+            .unwrap();
+            Self(root)
+        }
+
+        fn state(&self) -> PatcherState {
+            let mut config = Config::default();
+            config.patcher.ball_source = PatchSource::Custom;
+            PatcherState::new(&self.0, &config)
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn deleting_one_ball_preserves_other_entries_and_shared_texture() {
+        let fixture = Fixture::new();
+        let mut state = fixture.state();
+        let first = state
+            .balls
+            .iter()
+            .find(|ball| ball.name == "First")
+            .unwrap()
+            .clone();
+        state.delete_local_patch(&first).unwrap();
+        assert_eq!(state.balls.len(), 1);
+        assert_eq!(state.balls[0].name, "Second");
+        assert!(first.image_path.exists());
+        let second = state.balls[0].clone();
+        state.delete_local_patch(&second).unwrap();
+        assert!(state.balls.is_empty());
+        assert!(!second.json_path.exists());
+        assert!(!second.image_path.exists());
+        assert!(state.balls_dir.exists());
+    }
+
+    #[test]
+    fn applied_and_processing_balls_cannot_be_deleted() {
+        let fixture = Fixture::new();
+        let mut state = fixture.state();
+        let ball = state.balls[0].clone();
+        state.active_ball = Some(ball.name.clone());
+        assert!(state.delete_local_patch(&ball).is_err());
+        assert_eq!(state.active_ball.as_deref(), Some(ball.name.as_str()));
+        state.active_ball = None;
+        state.processing_target = Some("Global_Restore".into());
+        assert!(state.delete_local_patch(&ball).is_err());
+        assert!(ball.json_path.exists());
+        assert!(ball.image_path.exists());
+    }
+
+    #[test]
+    fn outside_texture_and_missing_manifest_fail_without_deleting_files() {
+        let fixture = Fixture::new();
+        let mut state = fixture.state();
+        let mut ball = state.balls[0].clone();
+        let outside = fixture.0.join("outside.png");
+        fs::write(&outside, b"outside").unwrap();
+        ball.image_path = outside.clone();
+        assert!(state.delete_local_patch(&ball).is_err());
+        assert!(ball.json_path.exists());
+        assert!(outside.exists());
+        ball.json_path = fixture.0.join("balls/missing.json");
+        assert!(state.delete_local_patch(&ball).is_err());
+        assert!(outside.exists());
+    }
+
+    #[test]
+    fn current_ball_tab_renders_delete_confirmation() {
+        let fixture = Fixture::new();
+        let mut state = fixture.state();
+        let ball = state.balls[0].clone();
+        state.confirm_delete = Some(ball.clone());
+        let ctx = egui::Context::default();
+        let (tx, _) = crossbeam_channel::unbounded();
+        let mut config = Config::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                state.render_ball_tab(
+                    ui,
+                    &fixture.0,
+                    &fixture.0,
+                    &fixture.0,
+                    &tx,
+                    &ctx,
+                    &mut config,
+                );
+            });
+        });
+        assert!(
+            ctx.read_response(egui::Id::new("render-confirm-deletion"))
+                .is_some()
+        );
+        state.active_ball = Some(ball.name);
+        state.render_delete_confirmation(&ctx, &tx);
+        assert!(state.confirm_delete.is_none());
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PatcherSubTab {
+    Ball,
+}
+
+#[allow(dead_code)]
+#[derive(Clone)]
+pub struct BallItem {
+    pub name: String,
+    pub json_path: PathBuf,
+    pub image_path: PathBuf,
+    pub image_bytes: Option<Arc<[u8]>>,
+}
+
+#[derive(Deserialize)]
+struct BallParams {
+    #[serde(rename = "Diffuse")]
+    diffuse: String,
+}
+
+#[derive(Deserialize)]
+struct BallDef {
+    #[serde(rename = "Group")]
+    _group: Option<String>,
+    #[serde(rename = "Params")]
+    params: BallParams,
+}
+
+enum PatcherOp {
+    Applied(String),
+    Restored,
+    Error(String),
+}
+
+pub struct PatcherState {
+    base_dir: PathBuf,
+    balls_dir: PathBuf,
+    #[allow(dead_code)]
+    subtab: PatcherSubTab,
+    pub balls: Vec<BallItem>,
+    pub active_ball: Option<String>,
+    pub processing_target: Option<String>,
+    pub search_input: String,
+    pub search_filter: String,
+    pub show_applied: bool,
+    pub page: usize,
+    pub(crate) source: PatchSource,
+    catalog: PatchCatalog,
+    local_tx: Sender<PatcherOp>,
+    local_rx: Receiver<PatcherOp>,
+    pub confirm_delete: Option<BallItem>,
+}
+
+impl PatcherState {
+    pub fn new(base_dir: &Path, config: &Config) -> Self {
+        let balls_dir = base_dir.join("balls");
+        if !balls_dir.exists() {
+            let _ = fs::create_dir_all(&balls_dir);
+        }
+
+        let (local_tx, local_rx) = crossbeam_channel::unbounded();
+
+        let mut state = Self {
+            base_dir: base_dir.to_path_buf(),
+            balls_dir,
+            subtab: PatcherSubTab::Ball,
+            balls: Vec::new(),
+            active_ball: config.patcher.active_ball.clone(),
+            processing_target: None,
+            search_input: String::new(),
+            search_filter: String::new(),
+            show_applied: false,
+            page: 0,
+            source: config.patcher.ball_source,
+            catalog: PatchCatalog::new(base_dir, "ball"),
+            confirm_delete: None,
+            local_tx,
+            local_rx,
+        };
+        state.refresh_balls();
+        state
+    }
+
+    pub fn refresh_balls(&mut self) {
+        self.balls.clear();
+        if !self.balls_dir.exists() {
+            return;
+        }
+
+        let mut to_visit = vec![self.balls_dir.clone()];
+        while let Some(dir) = to_visit.pop() {
+            if let Ok(entries) = fs::read_dir(&dir) {
+                for entry in entries.filter_map(|e| e.ok()) {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        to_visit.push(path);
+                    } else if path.extension().and_then(|s| s.to_str()) == Some("json") {
+                        self.parse_ball_json(&path);
+                    }
+                }
+            }
+        }
+    }
+
+    fn parse_ball_json(&mut self, json_path: &Path) {
+        if let Ok(content) = fs::read_to_string(json_path) {
+            if let Ok(parsed) = serde_json::from_str::<HashMap<String, BallDef>>(&content) {
+                for (name, def) in parsed {
+                    if let Some(parent) = json_path.parent() {
+                        let diffuse_name = &def.params.diffuse;
+                        let mut img_path = parent.join(diffuse_name);
+
+                        if !img_path.exists() {
+                            let target_stem = Path::new(diffuse_name)
+                                .file_stem()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .to_lowercase();
+
+                            if let Ok(entries) = fs::read_dir(parent) {
+                                for entry in entries.filter_map(|e| e.ok()) {
+                                    let p = entry.path();
+                                    if p.is_file() {
+                                        if let Some(stem) = p.file_stem() {
+                                            if stem.to_string_lossy().to_lowercase() == target_stem
+                                            {
+                                                img_path = p;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        let bytes = if img_path.exists() {
+                            fs::read(&img_path).ok().map(Arc::from)
+                        } else {
+                            None
+                        };
+
+                        if img_path.exists() {
+                            self.balls.push(BallItem {
+                                name,
+                                json_path: json_path.to_path_buf(),
+                                image_path: img_path,
+                                image_bytes: bytes,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn spawn_restore_thread(
+        &mut self,
+        cooked_pc: &Path,
+        _upk_path: &Path,
+        backups_dir: &Path,
+        tx: &Sender<AppMsg>,
+        ctx: &egui::Context,
+    ) {
+        if crate::messages::block_item_action_if_game_running(tx) {
+            return;
+        }
+        self.processing_target = Some("Global_Restore".to_string());
+
+        let cooked_pc_clone = cooked_pc.to_path_buf();
+        let backups_dir_clone = backups_dir.to_path_buf();
+        let local_tx = self.local_tx.clone();
+        let ctx_clone = ctx.clone();
+
+        let _ = tx.send(AppMsg::Log(
+            "[Patcher] Restoring original files...".to_string(),
+        ));
+        let tx_clone = tx.clone();
+
+        std::thread::spawn(move || {
+            if let Err(error) = crate::patcher::backup_guard::check(
+                &cooked_pc_clone,
+                &backups_dir_clone,
+                "ball-build.sha256",
+                is_ball_backup,
+            ) {
+                let _ = local_tx.send(PatcherOp::Error(error));
+                ctx_clone.request_repaint();
+                return;
+            }
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut restored = 0usize;
+                let mut errors: Vec<String> = Vec::new();
+                let mut total = 0usize;
+
+                // The C# patcher touches every ball-bearing UPK, not only the
+                // mutator and Soccar packages. Restore all corresponding
+                // backups so changing/restoring a ball cannot leave stale
+                // distance mips in arena or game-mode packages.
+                if let Ok(entries) = fs::read_dir(&backups_dir_clone) {
+                    for backup in entries
+                        .filter_map(|entry| entry.ok())
+                        .map(|entry| entry.path())
+                    {
+                        let Some(name) = backup.file_name().and_then(|name| name.to_str()) else {
+                            continue;
+                        };
+                        let Some(live_name) = name.strip_suffix(".upk.bak") else {
+                            continue;
+                        };
+                        let live_file_name = format!("{live_name}.upk");
+                        if !crate::patch_core::gameinfo::is_ball_upk(&live_file_name) {
+                            continue;
+                        }
+                        // Copying the backup over a menu or arena swap would erase it.
+                        if crate::patch_core::gameinfo::owned_elsewhere(
+                            &cooked_pc_clone,
+                            &live_file_name,
+                        ) {
+                            continue;
+                        }
+                        let live_path = cooked_pc_clone.join(&live_file_name);
+                        match fs::read(&backup)
+                            .map_err(|error| error.to_string())
+                            .and_then(|bytes| {
+                                super::upk_history::install_linked(
+                                    &cooked_pc_clone,
+                                    &live_path,
+                                    &bytes,
+                                    "Restore ball textures",
+                                )
+                            }) {
+                            Ok(_) => restored += 1,
+                            Err(error) => errors.push(format!("{live_name}.upk: {error}")),
+                        }
+                    }
+                }
+
+                if let Ok(entries) = fs::read_dir(&backups_dir_clone) {
+                    let bin_entries: Vec<PathBuf> = entries
+                        .filter_map(|e| e.ok())
+                        .map(|e| e.path())
+                        .filter(|p| {
+                            p.file_name()
+                                .and_then(|name| name.to_str())
+                                .is_some_and(crate::patch_core::standard_ball::is_ball_tfc_backup)
+                        })
+                        .collect();
+
+                    total = bin_entries.len();
+
+                    for (i, path) in bin_entries.into_iter().enumerate() {
+                        if total > 0 && (i % 25 == 0 || i + 1 == total) {
+                            let _ = tx_clone.send(AppMsg::Log(format!(
+                                "[Patcher] Restoring texture cache: {}/{total}...",
+                                i + 1
+                            )));
+                        }
+
+                        let Some(filename) = path.file_name().and_then(|name| name.to_str()) else {
+                            continue;
+                        };
+                        let Some(stem) = filename.strip_suffix(".bin") else {
+                            continue;
+                        };
+                        let Some((tfc_name, offset)) = stem.rsplit_once('_') else {
+                            continue;
+                        };
+                        let Ok(offset) = offset.parse::<u64>() else {
+                            continue;
+                        };
+                        let tfc_live_path = cooked_pc_clone.join(tfc_name);
+                        if !tfc_live_path.exists() {
+                            continue;
+                        }
+
+                        let step = (|| -> std::io::Result<()> {
+                            let backup_bytes = fs::read(&path)?;
+                            let mut live_file = std::fs::OpenOptions::new()
+                                .write(true)
+                                .open(&tfc_live_path)?;
+                            std::io::Seek::seek(&mut live_file, std::io::SeekFrom::Start(offset))?;
+                            std::io::Write::write_all(&mut live_file, &backup_bytes)?;
+                            Ok(())
+                        })();
+
+                        match step {
+                            Ok(_) => restored += 1,
+                            Err(e) => errors.push(format!("{}: {e}", path.display())),
+                        }
+                    }
+                }
+
+                let _ = tx_clone.send(AppMsg::Log(format!(
+                    "[Patcher] Texture cache restore pass finished: {restored}/{total} entries restored.",
+                    total = total
+                )));
+
+                (restored, errors)
+            }));
+
+            match outcome {
+                Ok((restored, errors)) => {
+                    if restored > 0 {
+                        let _ = local_tx.send(PatcherOp::Restored);
+                        if !errors.is_empty() {
+                            let _ = tx_clone.send(AppMsg::Log(format!(
+                                "[Patcher] Restore completed with {} issue(s): {}",
+                                errors.len(),
+                                errors.join("; ")
+                            )));
+                        }
+                    } else if !errors.is_empty() {
+                        let _ = local_tx.send(PatcherOp::Error(format!(
+                            "Restore failed: {}. The game may have these files open - close Rocket League and try again.",
+                            errors.join("; ")
+                        )));
+                    } else {
+                        let _ = local_tx.send(PatcherOp::Error(
+                            t("spawn-restore-thread-no-backups-found-to-restore").into(),
+                        ));
+                    }
+                }
+                Err(_) => {
+                    let _ = local_tx.send(PatcherOp::Error(
+                        t("spawn-restore-thread-restore-hit-an-unexpected-internal-error").into(),
+                    ));
+                }
+            }
+            ctx_clone.request_repaint();
+        });
+    }
+
+    pub fn begin_restore(
+        &mut self,
+        cooked_pc: &Path,
+        backups_dir: &Path,
+        tx: &Sender<AppMsg>,
+        ctx: &egui::Context,
+    ) {
+        let upk = cooked_pc.join("Mutators_Balls_SF.upk");
+        self.spawn_restore_thread(cooked_pc, &upk, backups_dir, tx, ctx);
+    }
+
+    pub fn begin_apply_named(
+        &mut self,
+        name: &str,
+        cooked_pc: &Path,
+        backups_dir: &Path,
+        tx: &Sender<AppMsg>,
+        ctx: &egui::Context,
+    ) -> Result<(), String> {
+        let ball = self
+            .balls
+            .iter()
+            .find(|ball| ball.name == name)
+            .cloned()
+            .ok_or_else(|| format!("Ball '{name}' is not installed locally"))?;
+        let upk = cooked_pc.join("Mutators_Balls_SF.upk");
+        self.spawn_apply_thread(&ball, cooked_pc, &upk, backups_dir, tx, ctx);
+        Ok(())
+    }
+
+    pub fn poll_ops(&mut self, tx: &Sender<AppMsg>, ctx: &egui::Context, config: &mut Config) {
+        let mut received = false;
+        while let Ok(op) = self.local_rx.try_recv() {
+            received = true;
+            self.processing_target = None;
+            match op {
+                PatcherOp::Applied(name) => {
+                    self.active_ball = Some(name.clone());
+                    config.patcher.active_ball = Some(name.clone());
+                    let _ = tx.send(AppMsg::Log(format!(
+                        "[Patcher] Successfully applied {name}!"
+                    )));
+                }
+                PatcherOp::Restored => {
+                    self.active_ball = None;
+                    config.patcher.active_ball = None;
+                    let _ = tx.send(AppMsg::Log(
+                        "[Patcher] Restored original ball successfully.".into(),
+                    ));
+                }
+                PatcherOp::Error(error) => {
+                    if error.starts_with("Rocket League was updated") {
+                        self.active_ball = None;
+                        config.patcher.active_ball = None;
+                    }
+                    let _ = tx.send(AppMsg::Log(format!("[Patcher] Error: {error}")));
+                }
+            }
+            let _ = config.save(&self.base_dir);
+        }
+        if received {
+            ctx.request_repaint();
+        }
+    }
+
+    fn spawn_apply_thread(
+        &mut self,
+        ball: &BallItem,
+        cooked_pc: &Path,
+        upk_path: &Path,
+        backups_dir: &Path,
+        tx: &Sender<AppMsg>,
+        ctx: &egui::Context,
+    ) {
+        if crate::messages::block_item_action_if_game_running(tx) {
+            return;
+        }
+        self.processing_target = Some(ball.name.clone());
+        let ball_name = ball.name.clone();
+        let upk_clone = upk_path.to_path_buf();
+        let cooked_clone = cooked_pc.to_path_buf();
+        let backups_clone = backups_dir.to_path_buf();
+        let img_clone = ball.image_path.clone();
+        let local_tx = self.local_tx.clone();
+        let ctx_clone = ctx.clone();
+        let _ = tx.send(AppMsg::Log(format!("[Patcher] Patching {}...", ball.name)));
+        let _ = tx.send(AppMsg::Log(format!(
+            "[Patcher] Ball patch mode: standard textures and matching inline ball mips. Executable: {}",
+            std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "unknown".into())
+        )));
+        std::thread::spawn(move || {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if !upk_clone.exists() {
+                    return Err("Mutators_Balls_SF.upk not found in game directory.".to_string());
+                }
+
+                let img_bytes =
+                    fs::read(&img_clone).map_err(|e| format!("Failed to read image: {e}"))?;
+                crate::patch_core::standard_ball::validate_standard_tfcs(
+                    &cooked_clone.to_string_lossy(),
+                )?;
+                crate::patcher::backup_guard::prepare(
+                    &cooked_clone,
+                    &backups_clone,
+                    "ball-build.sha256",
+                    is_ball_backup,
+                )?;
+                // Legacy mutator texture writes lack compatible offsets and restore coverage.
+                crate::patch_core::standard_ball::patch_standard_tfcs(
+                    &cooked_clone.to_string_lossy(),
+                    &backups_clone.to_string_lossy(),
+                    &img_bytes,
+                )?;
+                let patched_packages = crate::patch_core::gameinfo::patch_ball_upks(
+                    &cooked_clone.to_string_lossy(),
+                    &backups_clone.to_string_lossy(),
+                    &img_bytes,
+                )?;
+                if patched_packages == 0 {
+                    return Err(t("spawn-apply-thread-no-matching-inline-ball-mips-were").into());
+                }
+                Ok(())
+            }));
+            let op = match outcome {
+                Ok(Ok(())) => PatcherOp::Applied(ball_name),
+                Ok(Err(e)) => PatcherOp::Error(e),
+                Err(_) => PatcherOp::Error("Fatal thread panic while patching ball".into()),
+            };
+            let _ = local_tx.send(op);
+            ctx_clone.request_repaint();
+        });
+    }
+
+    #[allow(dead_code)]
+    pub fn render(
+        &mut self,
+        ui: &mut egui::Ui,
+        rl_path: &str,
+        tx: &Sender<AppMsg>,
+        ctx: &egui::Context,
+        config: &mut Config,
+    ) {
+        let mut received_patcher_op = false;
+
+        while let Ok(op) = self.local_rx.try_recv() {
+            received_patcher_op = true;
+            self.processing_target = None;
+            match op {
+                PatcherOp::Applied(name) => {
+                    self.active_ball = Some(name.clone());
+                    config.patcher.active_ball = self.active_ball.clone();
+                    let _ = config.save(&self.base_dir);
+                    let _ = tx.send(AppMsg::Log(format!(
+                        "[Patcher] Successfully applied {}!",
+                        name
+                    )));
+                }
+                PatcherOp::Restored => {
+                    self.active_ball = None;
+                    config.patcher.active_ball = None;
+                    let _ = config.save(&self.base_dir);
+                    let _ = tx.send(AppMsg::Log(
+                        "[Patcher] Restored original ball successfully.".to_string(),
+                    ));
+                }
+                PatcherOp::Error(e) => {
+                    if e.starts_with("Rocket League was updated") {
+                        self.active_ball = None;
+                        config.patcher.active_ball = None;
+                        let _ = config.save(&self.base_dir);
+                    }
+                    let _ = tx.send(AppMsg::Log(format!("[Patcher] Error: {}", e)));
+                }
+            }
+        }
+
+        if received_patcher_op {
+            ctx.request_repaint();
+        }
+
+        let cooked_pc = Path::new(rl_path).join("TAGame").join("CookedPCConsole");
+        let backups_dir = cooked_pc.join("Backups");
+        let upk_path = cooked_pc.join("Mutators_Balls_SF.upk");
+
+        egui::Panel::left("patcher_settings_list")
+            .resizable(false)
+            .exact_size(150.0)
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("patcher_subtabs")
+                    .show(ui, |ui| {
+                        crate::panel::followed(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.subtab,
+                                PatcherSubTab::Ball,
+                                t("render-ball"),
+                            );
+                        })
+                    });
+            });
+
+        egui::CentralPanel::default()
+            .frame(crate::i18n::layout::subtab_content_frame())
+            .show(ui, |ui| match self.subtab {
+                PatcherSubTab::Ball => {
+                    self.render_ball_tab(ui, &cooked_pc, &upk_path, &backups_dir, tx, ctx, config)
+                }
+            });
+    }
+
+    fn can_delete(&self, ball: &BallItem) -> bool {
+        self.processing_target.is_none() && self.active_ball.as_deref() != Some(ball.name.as_str())
+    }
+
+    fn delete_local_patch(&mut self, ball: &BallItem) -> Result<(), String> {
+        if !self.can_delete(ball) {
+            return Err(
+                "Restore the applied ball and wait for patching to finish before deleting".into(),
+            );
+        }
+        // Validate resolved paths before changing anything. Manifests can share
+        // textures or contain several balls, so never delete the whole folder.
+        let root = fs::canonicalize(&self.balls_dir).map_err(|e| e.to_string())?;
+        let manifest = fs::canonicalize(&ball.json_path).map_err(|e| e.to_string())?;
+        let image = fs::canonicalize(&ball.image_path).map_err(|e| e.to_string())?;
+        for path in [&manifest, &image] {
+            if !path.starts_with(&root) || !path.is_file() {
+                return Err("Refusing to delete files outside Hebnix's balls folder".into());
+            }
+        }
+        let mut json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&manifest).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
+        let entries = json.as_object_mut().ok_or("Invalid ball manifest")?;
+        if entries.remove(&ball.name).is_none() {
+            return Err("Ball is no longer present in its manifest; refresh and try again".into());
+        }
+        let shared_image = self.balls.iter().any(|other| {
+            (other.json_path != ball.json_path || other.name != ball.name)
+                && fs::canonicalize(&other.image_path).ok().as_ref() == Some(&image)
+        });
+        let remove_manifest = entries.is_empty();
+        let result = (|| -> Result<(), String> {
+            if remove_manifest {
+                fs::remove_file(&manifest).map_err(|e| e.to_string())?;
+            } else {
+                fs::write(
+                    &manifest,
+                    serde_json::to_vec_pretty(&json).map_err(|e| e.to_string())?,
+                )
+                .map_err(|e| e.to_string())?;
+            }
+            if !shared_image && image != manifest {
+                fs::remove_file(&image).map_err(|e| e.to_string())?;
+            }
+            // Remove empty import wrappers, stopping at the balls directory.
+            let mut parent = manifest.parent();
+            while let Some(path) = parent {
+                if path == root || !path.starts_with(&root) || fs::remove_dir(path).is_err() {
+                    break;
+                }
+                parent = path.parent();
+            }
+            Ok(())
+        })();
+        self.refresh_balls();
+        result
+    }
+
+    fn render_delete_confirmation(&mut self, ctx: &egui::Context, tx: &Sender<AppMsg>) {
+        if let Some(ball_to_delete) = self.confirm_delete.clone() {
+            // Recheck when an operation finishes while the dialog is open.
+            if !self.can_delete(&ball_to_delete) {
+                self.confirm_delete = None;
+                return;
+            }
+            let mut close = false;
+            egui::Window::new(t("render-confirm-deletion"))
+                .id(egui::Id::new("render-confirm-deletion"))
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label(t_args(
+                        "render-are-you-sure-you-want-to",
+                        &[("ball_to_delete", ball_to_delete.name.to_string().into())],
+                    ));
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button(t("plugin-delete-prompt-yes")).clicked() {
+                            let message = match self.delete_local_patch(&ball_to_delete) {
+                                Ok(()) => {
+                                    format!("[Patcher] Deleted ball '{}'", ball_to_delete.name)
+                                }
+                                Err(error) => format!(
+                                    "[Patcher] Could not delete ball '{}': {error}",
+                                    ball_to_delete.name
+                                ),
+                            };
+                            let _ = tx.send(AppMsg::Log(message));
+                            close = true;
+                        }
+                        if ui.button(t("plugin-delete-prompt-no")).clicked() {
+                            close = true;
+                        }
+                    });
+                });
+            if close {
+                self.confirm_delete = None;
+            }
+        }
+    }
+
+    pub fn render_ball_tab(
+        &mut self,
+        ui: &mut egui::Ui,
+        cooked_pc: &Path,
+        upk_path: &Path,
+        backups_dir: &Path,
+        tx: &Sender<AppMsg>,
+        ctx: &egui::Context,
+        config: &mut Config,
+    ) {
+        let mut received_patcher_op = false;
+
+        while let Ok(op) = self.local_rx.try_recv() {
+            received_patcher_op = true;
+            self.processing_target = None;
+            match op {
+                PatcherOp::Applied(name) => {
+                    self.active_ball = Some(name.clone());
+                    config.patcher.active_ball = self.active_ball.clone();
+                    let _ = config.save(&self.base_dir);
+                    let _ = tx.send(AppMsg::Log(format!(
+                        "[Patcher] Successfully applied {}!",
+                        name
+                    )));
+                }
+                PatcherOp::Restored => {
+                    self.active_ball = None;
+                    config.patcher.active_ball = None;
+                    let _ = config.save(&self.base_dir);
+                    let _ = tx.send(AppMsg::Log(
+                        "[Patcher] Restored original ball successfully.".to_string(),
+                    ));
+                }
+                PatcherOp::Error(e) => {
+                    if e.starts_with("Rocket League was updated") {
+                        self.active_ball = None;
+                        config.patcher.active_ball = None;
+                        let _ = config.save(&self.base_dir);
+                    }
+                    let _ = tx.send(AppMsg::Log(format!("[Patcher] Error: {}", e)));
+                }
+            }
+        }
+
+        if received_patcher_op {
+            ctx.request_repaint();
+        }
+
+        self.render_delete_confirmation(ctx, tx);
+
+        crate::ui::browser::header(ui, t("nav-ball-textures"), |ui| {
+            if ui.button(t("btn-refresh")).clicked() {
+                if self.source == PatchSource::Catalog {
+                    self.catalog.refresh(ctx);
+                } else {
+                    self.refresh_balls();
+                    let _ = tx.send(AppMsg::Log("[Patcher] Balls list refreshed.".to_string()));
+                }
+            }
+
+            let restore_enabled = self.active_ball.is_some() && self.processing_target.is_none();
+            if ui
+                .add_enabled(
+                    restore_enabled,
+                    egui::Button::new(t("ball-restore-original"))
+                        .fill(egui::Color32::from_rgb(180, 50, 50)),
+                )
+                .clicked()
+            {
+                self.spawn_restore_thread(cooked_pc, upk_path, backups_dir, tx, ctx);
+            }
+
+            if ui
+                .add_enabled(
+                    self.processing_target.is_none(),
+                    egui::Button::new(t("ball-import-zip")),
+                )
+                .clicked()
+            {
+                let dialog = rfd::FileDialog::new().add_filter(t("ball-zip-archives"), &["zip"]);
+                if let Some(file) = crate::winutil::parent_file_dialog(dialog).pick_file() {
+                    if self.import_zip(&file, tx) {
+                        self.source = PatchSource::Custom;
+                        config.patcher.ball_source = self.source;
+                        let _ = config.save(&self.base_dir);
+                    }
+                }
+            }
+            if ui
+                .checkbox(&mut self.show_applied, t("ball-show-applied"))
+                .changed()
+            {
+                self.page = 0;
+            }
+        });
+        ui.add_space(8.0);
+        if crate::ui::browser::search(ui, &mut self.search_input, t("ball-name-or-author")) {
+            self.search_filter = self.search_input.clone();
+            self.page = 0;
+        }
+
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(8.0);
+
+        if patch_source_selector(ui, &mut self.source) {
+            config.patcher.ball_source = self.source;
+            let _ = config.save(&self.base_dir);
+        }
+        ui.add_space(8.0);
+
+        if self.source == PatchSource::Catalog {
+            if let Some(path) = self.catalog.render(ui, &self.search_filter, ctx, tx) {
+                if self.import_zip(&path, tx) {
+                    self.source = PatchSource::Custom;
+                    config.patcher.ball_source = self.source;
+                    let _ = config.save(&self.base_dir);
+                }
+            }
+            return;
+        }
+
+        let query = self.search_filter.to_lowercase().trim().to_string();
+        let filtered: Vec<BallItem> = self
+            .balls
+            .iter()
+            .filter(|b| {
+                b.name.to_lowercase().contains(&query)
+                    && (!self.show_applied || self.active_ball.as_deref() == Some(b.name.as_str()))
+            })
+            .cloned()
+            .collect();
+
+        let column_count = crate::ui::browser::columns(ui, 224.0);
+        let page_size = column_count * crate::ui::browser::ROWS;
+        crate::ui::browser::pagination(ui, &mut self.page, filtered.len(), page_size);
+        if filtered.is_empty() {
+            ui.add_space(20.0);
+            ui.vertical_centered(|ui| {
+                if self.balls.is_empty() {
+                    ui.label(
+                        egui::RichText::new(t("ball-no-balls-found-in-the-balls"))
+                            .color(egui::Color32::GRAY),
+                    );
+                } else {
+                    ui.label(
+                        egui::RichText::new(t("ball-no-balls-match-your-search"))
+                            .color(egui::Color32::GRAY),
+                    );
+                }
+            });
+            return;
+        }
+
+        let start = self.page * page_size;
+        let visible: Vec<_> = filtered.into_iter().skip(start).take(page_size).collect();
+        egui::ScrollArea::vertical()
+            .id_salt("patcher_balls_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                crate::panel::followed(ui, |ui| {
+                    for row in visible.chunks(column_count) {
+                        ui.columns(column_count, |columns| {
+                            for (column, ball) in row.iter().enumerate() {
+                                egui::Frame::group(columns[column].style()).show(
+                                    &mut columns[column],
+                                    |ui| {
+                                        ui.set_min_height(190.0);
+                                        ui.vertical_centered(|ui| {
+                                            let size = egui::vec2(ui.available_width(), 120.0);
+                                            if let Some(bytes) = &ball.image_bytes {
+                                                let image = egui::Image::from_bytes(
+                                                    format!("bytes://ball/{}", ball.name),
+                                                    bytes.clone(),
+                                                );
+                                                ui.add(crate::ui::browser::cover_image(
+                                                    ui, image, size,
+                                                ));
+                                            } else {
+                                                ui.add_sized(
+                                                    size,
+                                                    egui::Label::new(t("ball-no-image")),
+                                                );
+                                            }
+                                            ui.strong(&ball.name);
+                                            ui.add_space(5.0);
+                                            let busy = self.processing_target.is_some();
+                                            if self.processing_target.as_deref()
+                                                == Some(ball.name.as_str())
+                                            {
+                                                ui.spinner();
+                                            } else if self.active_ball.as_deref()
+                                                == Some(ball.name.as_str())
+                                            {
+                                                if ui
+                                                    .add_enabled(
+                                                        !busy,
+                                                        egui::Button::new(t("app-restore"))
+                                                            .min_size(egui::vec2(
+                                                                ui.available_width(),
+                                                                24.0,
+                                                            )),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    self.spawn_restore_thread(
+                                                        cooked_pc,
+                                                        upk_path,
+                                                        backups_dir,
+                                                        tx,
+                                                        ctx,
+                                                    );
+                                                }
+                                            } else if ui
+                                                .add_enabled(
+                                                    !busy,
+                                                    egui::Button::new(t("ball-apply")).min_size(
+                                                        egui::vec2(ui.available_width(), 24.0),
+                                                    ),
+                                                )
+                                                .clicked()
+                                            {
+                                                self.spawn_apply_thread(
+                                                    ball,
+                                                    cooked_pc,
+                                                    upk_path,
+                                                    backups_dir,
+                                                    tx,
+                                                    ctx,
+                                                );
+                                            }
+                                            if ui
+                                                .add_enabled(
+                                                    self.can_delete(ball),
+                                                    egui::Button::new(t("presets-delete"))
+                                                        .fill(egui::Color32::from_rgb(180, 50, 50))
+                                                        .min_size(egui::vec2(
+                                                            ui.available_width(),
+                                                            24.0,
+                                                        )),
+                                                )
+                                                .clicked()
+                                            {
+                                                self.confirm_delete = Some(ball.clone());
+                                            }
+                                        });
+                                    },
+                                );
+                            }
+                        });
+                        ui.add_space(6.0);
+                    }
+                })
+            });
+    }
+
+    fn import_zip(&mut self, zip_path: &Path, tx: &Sender<AppMsg>) -> bool {
+        let _ = tx.send(AppMsg::Log("[Patcher] Extracting ZIP...".to_string()));
+
+        match (|| -> Result<(), String> {
+            let file = fs::File::open(zip_path).map_err(|e| e.to_string())?;
+            let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
+
+            let zip_stem = zip_path.file_stem().unwrap().to_string_lossy().to_string();
+            let temp_dir = self.balls_dir.join(format!("temp_{}", zip_stem));
+
+            fs::create_dir_all(&temp_dir).map_err(|e| e.to_string())?;
+            archive.extract(&temp_dir).map_err(|e| e.to_string())?;
+
+            let entries: Vec<_> = fs::read_dir(&temp_dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .collect();
+            if entries.len() == 1 && entries[0].file_type().unwrap().is_dir() {
+                let inner_dir = entries[0].path();
+                let dest = self.balls_dir.join(inner_dir.file_name().unwrap());
+                let _ = fs::rename(&inner_dir, &dest);
+                let _ = fs::remove_dir_all(&temp_dir);
+            } else {
+                let dest = self.balls_dir.join(&zip_stem);
+                let _ = fs::rename(&temp_dir, &dest);
+            }
+            Ok(())
+        })() {
+            Ok(_) => {
+                let _ = tx.send(AppMsg::Log("[Patcher] Imported successfully!".to_string()));
+                self.refresh_balls();
+                true
+            }
+            Err(e) => {
+                let _ = tx.send(AppMsg::Log(format!(
+                    "[Patcher] Failed to import ZIP: {}",
+                    e
+                )));
+                false
+            }
+        }
+    }
+}

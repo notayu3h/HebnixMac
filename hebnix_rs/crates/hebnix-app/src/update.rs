@@ -1,0 +1,732 @@
+use serde_json::Value;
+use std::path::Path;
+use std::time::Duration;
+
+const INFO_URL: &str = "https://api.hebnix.com/info";
+
+#[derive(Debug, Clone)]
+pub struct UpdateInfo {
+    pub version: String,
+    pub setup_url: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChangelogEntry {
+    pub version: String,
+    pub changelog: String,
+    pub release_date: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ApiInfo {
+    pub update: Option<UpdateInfo>,
+    pub newest_changelog: Option<ChangelogEntry>,
+}
+fn is_newer_version(current: &str, remote: &str) -> bool {
+    let curr_parts: Vec<u32> = current.split('.').filter_map(|s| s.parse().ok()).collect();
+    let rem_parts: Vec<u32> = remote.split('.').filter_map(|s| s.parse().ok()).collect();
+
+    for i in 0..std::cmp::max(curr_parts.len(), rem_parts.len()) {
+        let c = curr_parts.get(i).unwrap_or(&0);
+        let r = rem_parts.get(i).unwrap_or(&0);
+        if r > c {
+            return true;
+        }
+        if r < c {
+            return false;
+        }
+    }
+    false
+}
+
+pub fn fetch_info(current_version: &str, lite: bool) -> Result<ApiInfo, String> {
+    let agent = ureq::AgentBuilder::new().try_proxy_from_env(false).build();
+    let resp = agent
+        .get(INFO_URL)
+        .set(
+            "User-Agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        )
+        .timeout(Duration::from_secs(10))
+        .call()
+        .map_err(|e| format!("Network error while checking for updates: {e}"))?;
+
+    let json: Value = resp
+        .into_json()
+        .map_err(|e| format!("Invalid JSON response: {e}"))?;
+    parse_info(&json, current_version, lite)
+}
+
+fn parse_info(json: &Value, current_version: &str, lite: bool) -> Result<ApiInfo, String> {
+    let latest_version = json
+        .get("latest_version")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let setup_url = json
+        .get(if lite { "lite_setup_url" } else { "setup_url" })
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+
+    if latest_version.is_empty() {
+        return Err("API response missing latest_version".to_string());
+    }
+
+    let newest_changelog = json
+        .get("changelog_history")
+        .and_then(Value::as_array)
+        .and_then(|entries| entries.first())
+        .map(|entry| ChangelogEntry {
+            version: entry
+                .get("version")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            changelog: entry
+                .get("changelog")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            release_date: entry
+                .get("release_date")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        });
+
+    let setup_url = if setup_url.is_empty() {
+        setup_url
+    } else {
+        url::Url::parse(INFO_URL)
+            .expect("static update API URL")
+            .join(&setup_url)
+            .map_err(|e| format!("Invalid update download URL: {e}"))?
+            .to_string()
+    };
+
+    let update = is_newer_version(current_version, &latest_version).then(|| UpdateInfo {
+        version: latest_version,
+        setup_url,
+    });
+    Ok(ApiInfo {
+        update,
+        newest_changelog,
+    })
+}
+
+pub fn render_changelog(ui: &mut eframe::egui::Ui, entry: &ChangelogEntry) {
+    ui.heading(crate::i18n::t_args(
+        "changelog-heading",
+        &[("version", entry.version.as_str().into())],
+    ));
+    if !entry.release_date.is_empty() {
+        ui.label(
+            eframe::egui::RichText::new(&entry.release_date)
+                .small()
+                .weak(),
+        );
+    }
+    ui.add_space(8.0);
+
+    // the window is capped in height, so the list scrolls instead of pushing the title bar and X off-screen
+    eframe::egui::ScrollArea::vertical()
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            for line in entry
+                .changelog
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+            {
+                let trimmed = line.trim();
+                // the [Added]/[Fixed]/[Removed] tags come from the server and stay as
+                // they are, only the label shown for them is translated
+                let (prefix, body, colour) = if let Some(body) = trimmed.strip_prefix("[Added]") {
+                    (
+                        crate::i18n::t("changelog-added"),
+                        body.trim().trim_start_matches(':').trim(),
+                        eframe::egui::Color32::from_rgb(46, 204, 113),
+                    )
+                } else if let Some(body) = trimmed.strip_prefix("[Fixed]") {
+                    (
+                        crate::i18n::t("changelog-fixed"),
+                        body.trim().trim_start_matches(':').trim(),
+                        eframe::egui::Color32::from_rgb(52, 152, 219),
+                    )
+                } else if let Some(body) = trimmed.strip_prefix("[Removed]") {
+                    (
+                        crate::i18n::t("changelog-removed"),
+                        body.trim().trim_start_matches(':').trim(),
+                        eframe::egui::Color32::from_rgb(231, 76, 60),
+                    )
+                } else {
+                    (String::new(), trimmed, ui.visuals().text_color())
+                };
+                ui.horizontal_wrapped(|ui| {
+                    if !prefix.is_empty() {
+                        ui.label(eframe::egui::RichText::new(&prefix).strong().color(colour));
+                    }
+                    ui.label(body);
+                });
+            }
+        });
+}
+
+/// Shared with the popup; the worker never blocks the UI thread.
+#[derive(Debug, Default, Clone)]
+pub struct DownloadProgress {
+    pub downloaded: u64,
+    pub total: Option<u64>,
+    pub ready: bool,
+}
+pub type SharedProgress = std::sync::Arc<std::sync::Mutex<DownloadProgress>>;
+
+pub fn render_progress(ui: &mut eframe::egui::Ui, progress: &SharedProgress) {
+    let state = progress.lock().unwrap().clone();
+    let fraction = state
+        .total
+        .filter(|n| *n > 0)
+        .map(|n| (state.downloaded as f32 / n as f32).min(1.0));
+    let text = if state.ready {
+        crate::i18n::t("update-restarting")
+    } else if let Some(total) = state.total {
+        format!(
+            "{:.1} / {:.1} MB",
+            state.downloaded as f64 / 1048576.0,
+            total as f64 / 1048576.0
+        )
+    } else {
+        format!("{:.1} MB", state.downloaded as f64 / 1048576.0)
+    };
+    let bar = eframe::egui::ProgressBar::new(fraction.unwrap_or(0.0)).text(text);
+    ui.add(if fraction.is_none() {
+        bar.animate(true)
+    } else {
+        bar
+    });
+}
+
+/// Download an EXE or ZIP beside the current executable, then stage the matching
+/// edition's validated EXE for the existing maintenance/restart flow.
+pub fn download_update(
+    setup_url: &str,
+    lite: bool,
+    progress: &SharedProgress,
+) -> Result<std::path::PathBuf, String> {
+    use std::io::{Read, Write};
+    if setup_url.is_empty() {
+        return Err(
+            "The update service has not supplied an EXE or ZIP URL for this edition of Hebnix."
+                .into(),
+        );
+    }
+    #[cfg(not(windows))]
+    return Err("In-app updates are available on Windows only.".into());
+    #[allow(unreachable_code)]
+    {
+        let url = url::Url::parse(setup_url).map_err(|e| format!("Invalid update URL: {e}"))?;
+        if url.scheme() != "https" {
+            return Err("The update URL must use HTTPS.".into());
+        }
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        let directory = exe.parent().ok_or("Executable has no parent directory")?;
+        let id = rand::random::<u64>();
+        let downloaded_file = directory.join(format!(".hebnix-update-{id:016x}.download"));
+        let staged = directory.join(format!(".hebnix-update-{id:016x}.exe"));
+        let result = (|| -> Result<(), String> {
+            let mut file = std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&downloaded_file)
+                .map_err(|e| format!("Cannot stage the update in {}: {e}", directory.display()))?;
+            let response = ureq::AgentBuilder::new()
+                .try_proxy_from_env(false)
+                .build()
+                .get(url.as_str())
+                .set("Accept-Encoding", "identity")
+                .timeout(Duration::from_secs(600))
+                .call()
+                .map_err(|e| format!("Failed to download update: {e}"))?;
+            let total = response
+                .header("Content-Length")
+                .and_then(|s| s.parse::<u64>().ok());
+            *progress.lock().unwrap() = DownloadProgress {
+                total,
+                ..Default::default()
+            };
+            let mut reader = response.into_reader();
+            let mut buffer = [0u8; 65536];
+            let mut downloaded = 0u64;
+            loop {
+                let count = reader
+                    .read(&mut buffer)
+                    .map_err(|e| format!("Download interrupted: {e}"))?;
+                if count == 0 {
+                    break;
+                }
+                file.write_all(&buffer[..count])
+                    .map_err(|e| e.to_string())?;
+                downloaded += count as u64;
+                progress.lock().unwrap().downloaded = downloaded;
+            }
+            if total.is_some_and(|n| n != downloaded) {
+                return Err("Incomplete update download.".into());
+            }
+            file.sync_all().map_err(|e| e.to_string())?;
+            drop(file);
+            stage_update_payload(&downloaded_file, &staged, lite)?;
+            progress.lock().unwrap().ready = true;
+            Ok(())
+        })();
+        let _ = std::fs::remove_file(&downloaded_file);
+        if let Err(error) = result {
+            let _ = std::fs::remove_file(&staged);
+            return Err(error);
+        }
+        Ok(staged)
+    }
+}
+
+/// Inspect the contents rather than the URL extension (CDNs may use query URLs).
+/// Only the matching EXE is extracted; bundled settings/assets never overwrite
+/// the user's existing data, and archive paths are never used as output paths.
+fn stage_update_payload(downloaded: &Path, staged: &Path, lite: bool) -> Result<(), String> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(downloaded).map_err(|e| e.to_string())?;
+    let mut signature = [0u8; 4];
+    let count = file.read(&mut signature).map_err(|e| e.to_string())?;
+    drop(file);
+    if count < 4 || !signature.starts_with(b"PK") {
+        validate_executable(downloaded)?;
+        return std::fs::rename(downloaded, staged).map_err(|e| e.to_string());
+    }
+
+    let file = std::fs::File::open(downloaded).map_err(|e| e.to_string())?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("Invalid update ZIP: {e}"))?;
+    let expected = if lite {
+        "hebnix-lite.exe"
+    } else {
+        "hebnix.exe"
+    };
+    let mut selected = None;
+    for index in 0..archive.len() {
+        let entry = archive
+            .by_index(index)
+            .map_err(|e| format!("Invalid update ZIP entry: {e}"))?;
+        if entry.is_dir() {
+            continue;
+        }
+        let Some(path) = entry.enclosed_name() else {
+            continue;
+        };
+        if path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case(expected))
+        {
+            if selected.replace(index).is_some() {
+                return Err(format!(
+                    "Update ZIP contains multiple copies of {expected}."
+                ));
+            }
+        }
+    }
+    let index = selected.ok_or_else(|| format!("Update ZIP does not contain {expected}."))?;
+    let entry = archive.by_index(index).map_err(|e| e.to_string())?;
+    const MAX_EXE_SIZE: u64 = 512 * 1024 * 1024;
+    let size = entry.size();
+    if size > MAX_EXE_SIZE {
+        return Err("Update executable is too large.".into());
+    }
+    let result = (|| {
+        let mut output = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(staged)
+            .map_err(|e| format!("Cannot extract update: {e}"))?;
+        let copied = std::io::copy(&mut entry.take(MAX_EXE_SIZE + 1), &mut output)
+            .map_err(|e| format!("Cannot extract update ZIP: {e}"))?;
+        if copied != size || copied > MAX_EXE_SIZE {
+            return Err("Incomplete update executable in ZIP.".into());
+        }
+        output.sync_all().map_err(|e| e.to_string())?;
+        drop(output);
+        validate_executable(staged)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(staged);
+    }
+    result
+}
+
+/// Reject HTML, ZIPs, truncated files and executables for a different CPU.
+fn validate_executable(path: &Path) -> Result<(), String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let mut dos = [0u8; 64];
+    file.read_exact(&mut dos)
+        .map_err(|_| "Update is not a complete Windows executable")?;
+    if &dos[..2] != b"MZ" {
+        return Err("Update is not a Windows EXE.".into());
+    }
+    let offset = u32::from_le_bytes(dos[60..64].try_into().unwrap()) as u64;
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|e| e.to_string())?;
+    let mut pe = [0u8; 24];
+    file.read_exact(&mut pe)
+        .map_err(|_| "Update has an incomplete PE header")?;
+    let machine = u16::from_le_bytes([pe[4], pe[5]]);
+    let expected = if cfg!(target_arch = "aarch64") {
+        0xaa64
+    } else {
+        0x8664
+    };
+    let characteristics = u16::from_le_bytes([pe[22], pe[23]]);
+    if &pe[..4] != b"PE\0\0" || machine != expected || characteristics & 0x2002 != 0x0002 {
+        return Err("Update is not a compatible Windows application.".into());
+    }
+    let sections = u16::from_le_bytes([pe[6], pe[7]]) as u64;
+    let optional_size = u16::from_le_bytes([pe[20], pe[21]]) as u64;
+    let size = file.metadata().map_err(|e| e.to_string())?.len();
+    let section_start = offset + 24 + optional_size;
+    if sections == 0 || sections > 96 || optional_size < 112 || section_start + sections * 40 > size
+    {
+        return Err("Update has an incomplete executable header.".into());
+    }
+    let mut magic = [0u8; 2];
+    file.read_exact(&mut magic).map_err(|e| e.to_string())?;
+    if magic != [0x0b, 0x02] {
+        return Err("Update must be a 64-bit Windows EXE.".into());
+    }
+    file.seek(SeekFrom::Start(section_start))
+        .map_err(|e| e.to_string())?;
+    for _ in 0..sections {
+        let mut section = [0u8; 40];
+        file.read_exact(&mut section).map_err(|e| e.to_string())?;
+        let raw_size = u32::from_le_bytes(section[16..20].try_into().unwrap()) as u64;
+        let raw_start = u32::from_le_bytes(section[20..24].try_into().unwrap()) as u64;
+        if raw_size > 0 && (raw_start < section_start || raw_start + raw_size > size) {
+            return Err("Update has an incomplete executable section.".into());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+const RELEASES_URL: &str = "https://github.com/HebnixRL/Hebnix-Public/releases";
+
+/// State of the non-blocking AppImage update banner.
+#[cfg(target_os = "linux")]
+pub struct AppImageBanner {
+    pub version: String,
+    pub downloading: bool,
+    pub done: bool,
+    pub error: Option<String>,
+}
+
+/// Path of the running AppImage, set by the AppImage runtime.
+#[cfg(target_os = "linux")]
+pub fn appimage_path() -> Option<std::path::PathBuf> {
+    std::env::var_os("APPIMAGE")
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_file())
+}
+
+/// Console line telling a Linux user how to update. `in_app` means the AppImage banner handles it.
+#[cfg(target_os = "linux")]
+pub fn linux_update_hint(in_app: bool) -> String {
+    let how = if appimage_path().is_some() {
+        if in_app {
+            "use the update banner to replace this AppImage".to_string()
+        } else {
+            format!("download the new AppImage from {RELEASES_URL}/latest")
+        }
+    } else if std::env::current_exe().is_ok_and(|p| p.starts_with("/usr")) {
+        "update with your package manager (Arch: `sudo pacman -Syu`, or your AUR helper for hebnix-linux-bin)".to_string()
+    } else {
+        format!("download the new tarball from {RELEASES_URL}/latest")
+    };
+    format!("[Core] To update: {how}.")
+}
+
+/// Download the release AppImage and rename it over the running one. Linux lets a
+/// running file be replaced by rename, so the new version takes effect on restart.
+#[cfg(target_os = "linux")]
+pub fn download_appimage(version: &str, progress: &SharedProgress) -> Result<(), String> {
+    use std::io::{Read, Write};
+    use std::os::unix::fs::PermissionsExt;
+    let target = appimage_path().ok_or("Not running from an AppImage.")?;
+    if version.is_empty()
+        || !version
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+    {
+        return Err("Invalid version string.".into());
+    }
+    let url = format!("{RELEASES_URL}/download/v{version}/Hebnix-{version}-x86_64.AppImage");
+    let mut tmp_name = target
+        .file_name()
+        .ok_or("AppImage has no file name")?
+        .to_owned();
+    tmp_name.push(".new");
+    let tmp = target.with_file_name(tmp_name);
+    let result = (|| -> Result<(), String> {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&tmp)
+            .map_err(|e| format!("Cannot stage the update in {}: {e}", tmp.display()))?;
+        let response = ureq::AgentBuilder::new()
+            .try_proxy_from_env(false)
+            .build()
+            .get(&url)
+            .set("Accept-Encoding", "identity")
+            .timeout(Duration::from_secs(600))
+            .call()
+            .map_err(|e| format!("Failed to download update: {e}"))?;
+        let total = response
+            .header("Content-Length")
+            .and_then(|s| s.parse::<u64>().ok());
+        *progress.lock().unwrap() = DownloadProgress {
+            total,
+            ..Default::default()
+        };
+        let mut reader = response.into_reader();
+        let mut buffer = [0u8; 65536];
+        let mut downloaded = 0u64;
+        loop {
+            let count = reader
+                .read(&mut buffer)
+                .map_err(|e| format!("Download interrupted: {e}"))?;
+            if count == 0 {
+                break;
+            }
+            file.write_all(&buffer[..count])
+                .map_err(|e| e.to_string())?;
+            downloaded += count as u64;
+            progress.lock().unwrap().downloaded = downloaded;
+        }
+        if total.is_some_and(|n| n != downloaded) {
+            return Err("Incomplete update download.".into());
+        }
+        file.sync_all().map_err(|e| e.to_string())?;
+        drop(file);
+        let mut magic = [0u8; 4];
+        std::fs::File::open(&tmp)
+            .and_then(|mut f| f.read_exact(&mut magic))
+            .map_err(|e| e.to_string())?;
+        if &magic != b"\x7fELF" {
+            return Err("The downloaded update is not an AppImage.".into());
+        }
+        let mode = std::fs::metadata(&target)
+            .map_err(|e| e.to_string())?
+            .permissions()
+            .mode();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode | 0o111))
+            .map_err(|e| e.to_string())?;
+        std::fs::rename(&tmp, &target)
+            .map_err(|e| format!("Cannot replace {}: {e}", target.display()))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn update_urls_keep_the_full_and_lite_editions_separate() {
+        let json = serde_json::json!({"latest_version": "9.0", "setup_url": "https://example.com/hebnix.exe", "lite_setup_url": "https://example.com/hebnix-lite.exe"});
+        assert_eq!(
+            parse_info(&json, "1.0", false)
+                .unwrap()
+                .update
+                .unwrap()
+                .setup_url,
+            "https://example.com/hebnix.exe"
+        );
+        assert_eq!(
+            parse_info(&json, "1.0", true)
+                .unwrap()
+                .update
+                .unwrap()
+                .setup_url,
+            "https://example.com/hebnix-lite.exe"
+        );
+        let json = serde_json::json!({"latest_version": "9.0", "setup_url": "https://example.com/hebnix.exe"});
+        assert!(
+            parse_info(&json, "1.0", true)
+                .unwrap()
+                .update
+                .unwrap()
+                .setup_url
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn rejects_archives_html_and_truncated_executables() {
+        let path =
+            std::env::temp_dir().join(format!("hebnix-exe-check-{:016x}", rand::random::<u64>()));
+        for data in [
+            b"PK\x03\x04".as_slice(),
+            b"<html>download failed</html>",
+            &[0u8; 128],
+        ] {
+            std::fs::write(&path, data).unwrap();
+            assert!(validate_executable(&path).is_err());
+        }
+        let executable = std::env::current_exe().unwrap();
+        assert!(validate_executable(&executable).is_ok());
+        let bytes = std::fs::read(executable).unwrap();
+        // All headers remain present, but the final raw section is incomplete.
+        std::fs::write(&path, &bytes[..bytes.len() / 2]).unwrap();
+        assert!(validate_executable(&path).is_err());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    fn fake_executable(marker: u8) -> Vec<u8> {
+        let mut bytes = vec![0; 512];
+        bytes[..2].copy_from_slice(b"MZ");
+        bytes[60..64].copy_from_slice(&64u32.to_le_bytes());
+        bytes[64..68].copy_from_slice(b"PE\0\0");
+        let machine: u16 = if cfg!(target_arch = "aarch64") {
+            0xaa64
+        } else {
+            0x8664
+        };
+        bytes[68..70].copy_from_slice(&machine.to_le_bytes());
+        bytes[70..72].copy_from_slice(&1u16.to_le_bytes());
+        bytes[84..86].copy_from_slice(&112u16.to_le_bytes());
+        bytes[86..88].copy_from_slice(&2u16.to_le_bytes());
+        bytes[88..90].copy_from_slice(&0x20bu16.to_le_bytes());
+        bytes[216..220].copy_from_slice(&20u32.to_le_bytes());
+        bytes[220..224].copy_from_slice(&256u32.to_le_bytes());
+        bytes[256] = marker;
+        bytes
+    }
+
+    struct PayloadFixture(std::path::PathBuf);
+    impl PayloadFixture {
+        fn new() -> Self {
+            let path = std::env::temp_dir()
+                .join(format!("hebnix-update-test-{:016x}", rand::random::<u64>()));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+        fn zip(&self, entries: &[(&str, &[u8])]) -> std::path::PathBuf {
+            use std::io::Write;
+            let path = self.0.join("payload.download");
+            let mut archive = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+            for (name, bytes) in entries {
+                archive
+                    .start_file(*name, zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                archive.write_all(bytes).unwrap();
+            }
+            archive.finish().unwrap();
+            path
+        }
+    }
+    impl Drop for PayloadFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn stages_direct_executable_without_requiring_a_url_extension() {
+        let fixture = PayloadFixture::new();
+        let downloaded = fixture.0.join("payload.download");
+        let staged = fixture.0.join("staged.exe");
+        let bytes = fake_executable(7);
+        std::fs::write(&downloaded, &bytes).unwrap();
+        stage_update_payload(&downloaded, &staged, false).unwrap();
+        assert_eq!(std::fs::read(staged).unwrap(), bytes);
+        assert!(!downloaded.exists());
+    }
+
+    #[test]
+    fn extracts_only_the_matching_edition_from_nested_zip() {
+        let full = fake_executable(1);
+        let lite = fake_executable(2);
+        for is_lite in [false, true] {
+            let fixture = PayloadFixture::new();
+            let downloaded = fixture.zip(&[
+                ("release/HEBNIX.EXE", &full),
+                ("release/hebnix-lite.exe", &lite),
+                ("release/config.toml", b"do not overwrite my settings"),
+            ]);
+            let staged = fixture.0.join("staged.exe");
+            stage_update_payload(&downloaded, &staged, is_lite).unwrap();
+            assert_eq!(
+                std::fs::read(staged).unwrap(),
+                if is_lite { &lite } else { &full }.as_slice()
+            );
+            assert!(!fixture.0.join("release").exists());
+            assert!(!fixture.0.join("config.toml").exists());
+        }
+    }
+
+    #[test]
+    fn rejects_missing_ambiguous_unsafe_and_invalid_zip_executables() {
+        let exe = fake_executable(1);
+        for entries in [
+            vec![("hebnix-lite.exe", exe.as_slice())],
+            vec![
+                ("a/hebnix.exe", exe.as_slice()),
+                ("b/hebnix.exe", exe.as_slice()),
+            ],
+            vec![("../hebnix.exe", exe.as_slice())],
+            vec![("hebnix.exe", b"<html>not an exe</html>".as_slice())],
+        ] {
+            let fixture = PayloadFixture::new();
+            let downloaded = fixture.zip(&entries);
+            let staged = fixture.0.join("staged.exe");
+            assert!(stage_update_payload(&downloaded, &staged, false).is_err());
+            assert!(!staged.exists());
+        }
+        let fixture = PayloadFixture::new();
+        let downloaded = fixture.0.join("payload.download");
+        let staged = fixture.0.join("staged.exe");
+        std::fs::write(&downloaded, b"PK\x03\x04truncated archive").unwrap();
+        assert!(stage_update_payload(&downloaded, &staged, false).is_err());
+        assert!(!staged.exists());
+    }
+
+    #[test]
+    fn current_version_does_not_offer_itself_as_an_update() {
+        let json = serde_json::json!({"latest_version": "2.3.0", "setup_url": "https://example.com/hebnix.zip", "lite_setup_url": "https://example.com/hebnix-lite.exe"});
+        for lite in [false, true] {
+            assert!(parse_info(&json, "2.3.0", lite).unwrap().update.is_none());
+            assert!(parse_info(&json, "2.2.6", lite).unwrap().update.is_some());
+        }
+    }
+    #[test]
+    fn resolves_relative_api_download_urls_for_both_editions() {
+        let json = serde_json::json!({
+            "latest_version": "2.3.1",
+            "setup_url": "/download-hebnix",
+            "lite_setup_url": "/downloads/hebnix-lite.zip"
+        });
+        assert_eq!(
+            parse_info(&json, "2.3.0", false)
+                .unwrap()
+                .update
+                .unwrap()
+                .setup_url,
+            "https://api.hebnix.com/download-hebnix"
+        );
+        assert_eq!(
+            parse_info(&json, "2.3.0", true)
+                .unwrap()
+                .update
+                .unwrap()
+                .setup_url,
+            "https://api.hebnix.com/downloads/hebnix-lite.zip"
+        );
+    }
+}

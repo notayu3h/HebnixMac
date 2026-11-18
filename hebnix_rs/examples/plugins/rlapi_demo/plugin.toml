@@ -1,0 +1,4 @@
+name = "RLAPI Demo"
+author = "Hebnix"
+version = "2.0.0"
+entry = "main.lua"
