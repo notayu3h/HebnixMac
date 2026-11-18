@@ -145,18 +145,25 @@ pub fn get_save_data_path(platform: RlPlatform) -> PathBuf {
     save_data_dir_in(&documents_dir(), platform)
 }
 
-/// Name-only check for a running Rocket League. Under Obelisk the guest process
-/// shows up as `RocketLeague.exe`, so a name match is enough.
+/// Under Obelisk the guest process is usually not reported as `RocketLeague.exe`
+/// at all: the native arm64 host (`fexdarwin-run` translating the guest, `wsd`
+/// presenting it) is what `ps`/`sysinfo` see. Match every known marker so the
+/// app agrees with the standalone macOS CLI (`hebnix_macos::process::MARKERS`).
+const RL_PROCESS_MARKERS: [&str; 4] = ["rocketleague", "rocketleague_eac", "fexdarwin-run", "wsd"];
+
+fn is_rl_name(name: &str) -> bool {
+    let base = name.to_ascii_lowercase();
+    let base = base.strip_suffix(".exe").unwrap_or(&base);
+    RL_PROCESS_MARKERS.iter().any(|marker| base.contains(marker))
+}
+
+/// Name-only check for a running Rocket League (or its Obelisk/Voile runtime).
 pub fn is_rocket_league_running() -> bool {
     let mut sys = System::new();
     sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
-    sys.processes().values().any(|process| {
-        process
-            .name()
-            .to_string_lossy()
-            .to_lowercase()
-            .contains("rocketleague")
-    })
+    sys.processes()
+        .values()
+        .any(|process| is_rl_name(&process.name().to_string_lossy()))
 }
 
 /// Fallible name-only enumeration for operations that require confirmed closure.
@@ -167,9 +174,10 @@ pub fn rocket_league_running_checked() -> Result<bool, String> {
         .output()
         .map_err(|error| format!("could not list processes: {error}"))?;
     let listing = String::from_utf8_lossy(&output.stdout);
-    Ok(listing
-        .lines()
-        .any(|line| line.to_ascii_lowercase().contains("rocketleague")))
+    Ok(listing.lines().any(|line| {
+        let name = line.rsplit(['/', '\\']).next().unwrap_or(line).trim();
+        is_rl_name(name)
+    }))
 }
 
 /// find the running RL process + its info. None if not running.
@@ -183,7 +191,7 @@ pub fn find_rocket_league() -> Option<RlProcessInfo> {
 
     for (pid, process) in sys.processes() {
         let name = process.name().to_string_lossy().to_lowercase();
-        if !name.contains("rocketleague") {
+        if !is_rl_name(&name) {
             continue;
         }
         let Some(exe) = process.exe() else {
