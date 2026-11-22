@@ -754,6 +754,8 @@ pub struct HebnixApp {
     confirm_restore_game: bool,
     #[cfg(target_os = "macos")]
     restore_game_status: Option<String>,
+    #[cfg(target_os = "macos")]
+    diagnostics_report: Option<String>,
     chat_export: crate::patcher::chat_export::State,
     lan_commands: crate::patcher::lan_commands::State,
     chat_paste: crate::patcher::chat_paste::State,
@@ -1401,6 +1403,8 @@ impl HebnixApp {
             confirm_restore_game: false,
             #[cfg(target_os = "macos")]
             restore_game_status: None,
+            #[cfg(target_os = "macos")]
+            diagnostics_report: None,
             chat_export: Default::default(),
             lan_commands: Default::default(),
             chat_paste: Default::default(),
@@ -5061,6 +5065,293 @@ impl HebnixApp {
         self.render_hebnix_settings(ui);
     }
 
+    /// Snapshot of everything that decides where macOS patches go. Detection
+    /// being green says nothing about the folder the patcher actually writes
+    /// to, so one report carries both sides plus the files on disk.
+    #[cfg(target_os = "macos")]
+    fn collect_diagnostics(&self) -> String {
+        use std::cmp::Reverse;
+        use std::fmt::Write as _;
+        use std::path::Path;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        fn utc_stamp(time: SystemTime) -> String {
+            let secs = time
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let days = secs / 86_400;
+            let rem = secs % 86_400;
+            // Howard Hinnant's civil_from_days, for readable UTC timestamps.
+            let z = days as i64 + 719_468;
+            let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+            let doe = z - era * 146_097;
+            let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+            let mut year = yoe + era * 400;
+            let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+            let mp = (5 * doy + 2) / 153;
+            let day = doy - (153 * mp + 2) / 5 + 1;
+            let month = mp + if mp < 10 { 3 } else { -9 };
+            if month <= 2 {
+                year += 1;
+            }
+            format!(
+                "{year:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
+                month,
+                day,
+                rem / 3600,
+                (rem / 60) % 60,
+                rem % 60
+            )
+        }
+
+        fn modified(path: &Path) -> String {
+            std::fs::metadata(path)
+                .and_then(|m| m.modified())
+                .map(utc_stamp)
+                .unwrap_or_else(|_| "missing".into())
+        }
+
+        fn entries(dir: &Path) -> usize {
+            std::fs::read_dir(dir).map(|it| it.count()).unwrap_or(0)
+        }
+
+        let mut out = String::new();
+        let rl = std::path::PathBuf::from(&self.config.settings.rl_path);
+        let cooked = rl.join("TAGame").join("CookedPCConsole");
+        let yes = |ok: bool| if ok { "yes" } else { "no" };
+
+        let _ = writeln!(out, "Hebnix Mac diagnostics");
+        let _ = writeln!(out, "Version: {}", crate::release_version::VERSION);
+        let _ = writeln!(
+            out,
+            "Generated: {}",
+            utc_stamp(SystemTime::now())
+        );
+        let _ = writeln!(out);
+        let _ = writeln!(out, "-- Configured game folder --");
+        let _ = writeln!(out, "rl_path: {}", rl.display());
+        let _ = writeln!(
+            out,
+            "  looks like RL (TAGame/ or Binaries/): {}",
+            yes(rl.join("TAGame").is_dir() || rl.join("Binaries").is_dir())
+        );
+        let _ = writeln!(
+            out,
+            "  has a Windows-style default path: {}",
+            yes(rl.to_string_lossy().contains(":\\"))
+        );
+        let _ = writeln!(
+            out,
+            "CookedPCConsole: {} ({} entries)",
+            yes(cooked.is_dir()),
+            entries(&cooked)
+        );
+        let ini = std::path::Path::new(&self.config.settings.statsapi_path);
+        let _ = writeln!(
+            out,
+            "DefaultStatsAPI.ini: {} ({})",
+            ini.display(),
+            yes(ini.is_file())
+        );
+        let _ = writeln!(
+            out,
+            "Force RL running toggle: {}",
+            self.config.settings.force_rl_running
+        );
+
+        let _ = writeln!(out);
+        let _ = writeln!(out, "-- Game process --");
+        let _ = writeln!(
+            out,
+            "is_rocket_league_running(): {}",
+            hebnix_sdk::process::is_rocket_league_running()
+        );
+        match hebnix_sdk::process::find_rocket_league() {
+            Some(info) => {
+                let _ = writeln!(out, "find_rocket_league(): found");
+                let _ = writeln!(out, "  pid: {}", info.pid);
+                let _ = writeln!(out, "  exe: {}", info.exe_path.display());
+                let _ = writeln!(out, "  root: {}", info.root_dir.display());
+                let _ = writeln!(out, "  platform: {:?}", info.platform);
+                let _ = writeln!(
+                    out,
+                    "  root matches rl_path: {}",
+                    yes(
+                        info.root_dir.to_string_lossy().trim_end_matches(['\\', '/'])
+                            .eq_ignore_ascii_case(
+                                rl.to_string_lossy().trim_end_matches(['\\', '/'])
+                            )
+                    )
+                );
+            }
+            None => {
+                let _ = writeln!(out, "find_rocket_league(): none (no game root resolved)");
+            }
+        }
+
+        let _ = writeln!(out);
+        let _ = writeln!(out, "-- Obelisk layout --");
+        let home = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_default();
+        let library = home
+            .join("Library")
+            .join("Application Support")
+            .join("com.zagrios.obelisk");
+        let _ = writeln!(
+            out,
+            "library: {} ({})",
+            library.display(),
+            yes(library.is_dir())
+        );
+        let games = library.join("Games");
+        let _ = writeln!(
+            out,
+            "Games: {} ({})",
+            games.display(),
+            yes(games.is_dir())
+        );
+        let mut game_dirs = Vec::new();
+        if let Ok(stores) = std::fs::read_dir(&games) {
+            for store in stores.flatten() {
+                if let Ok(installs) = std::fs::read_dir(store.path()) {
+                    for install in installs.flatten() {
+                        if install.path().is_dir() {
+                            game_dirs.push(install.path());
+                        }
+                    }
+                }
+            }
+        }
+        for dir in game_dirs.iter().take(16) {
+            let _ = writeln!(
+                out,
+                "  {} (RL: {})",
+                dir.display(),
+                yes(dir.join("TAGame").is_dir() || dir.join("Binaries").is_dir())
+            );
+        }
+        if game_dirs.is_empty() {
+            let _ = writeln!(out, "  (none found)");
+        }
+        let _ = writeln!(
+            out,
+            "Voile/current: {}",
+            yes(library.join("Voile").join("current").is_dir())
+        );
+
+        let _ = writeln!(out);
+        let _ = writeln!(out, "-- Patched-file evidence --");
+        let mut latest: Vec<(String, u64, SystemTime)> = Vec::new();
+        if let Ok(listing) = std::fs::read_dir(&cooked) {
+            for entry in listing.flatten() {
+                if let Ok(meta) = entry.metadata()
+                    && meta.is_file()
+                {
+                    latest.push((
+                        entry.file_name().to_string_lossy().into_owned(),
+                        meta.len(),
+                        meta.modified().unwrap_or(UNIX_EPOCH),
+                    ));
+                }
+            }
+        }
+        latest.sort_by_key(|(_, _, time)| Reverse(*time));
+        latest.truncate(12);
+        if latest.is_empty() {
+            let _ = writeln!(out, "  (no files readable in CookedPCConsole)");
+        }
+        for (name, size, time) in latest {
+            let _ = writeln!(
+                out,
+                "  {name:40} {size:>12} B  {}",
+                utc_stamp(time)
+            );
+        }
+
+        let _ = writeln!(out);
+        let _ = writeln!(out, "-- Backups --");
+        let backups = cooked.join("Backups");
+        let _ = writeln!(
+            out,
+            "Backups dir: {} ({} files)",
+            yes(backups.is_dir()),
+            entries(&backups)
+        );
+        let _ = writeln!(
+            out,
+            "install marker: {}",
+            yes(backups.join("hebnix-install-build.sha256").is_file())
+        );
+
+        let _ = writeln!(out);
+        let _ = writeln!(out, "-- Matching processes (ps, first 20) --");
+        let ps = std::process::Command::new("/bin/ps")
+            .args(["-Ao", "pid=,comm=,command="])
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        let markers = ["rocket", "fexdarwin", "wsd", "obelisk", "voile"];
+        let mut shown = 0;
+        for line in ps.lines() {
+            let lower = line.to_ascii_lowercase();
+            if markers.iter().any(|marker| lower.contains(marker)) {
+                let short: String = line.chars().take(240).collect();
+                let _ = writeln!(out, "  {short}");
+                shown += 1;
+                if shown == 20 {
+                    break;
+                }
+            }
+        }
+        if shown == 0 {
+            let _ = writeln!(out, "  (none)");
+        }
+        out
+    }
+
+    #[cfg(target_os = "macos")]
+    fn render_diagnostics(&mut self, ctx: &egui::Context) {
+        let Some(report) = self.diagnostics_report.clone() else {
+            return;
+        };
+        let mut close = false;
+        let mut copy = false;
+        egui::Window::new("Hebnix Mac diagnostics")
+            .id(egui::Id::new("hebnix-mac-diagnostics"))
+            .collapsible(false)
+            .resizable(true)
+            .default_size([580.0, 460.0])
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(
+                    "Paste this into a bug report. It shows the folder patches are written to, the game process, and recent file changes.",
+                );
+                ui.add_space(4.0);
+                let mut text = report.as_str();
+                ui.add_sized(
+                    [560.0, 360.0],
+                    egui::TextEdit::multiline(&mut text).font(egui::TextStyle::Monospace),
+                );
+                ui.horizontal(|ui| {
+                    if ui.button("Copy to clipboard").clicked() {
+                        copy = true;
+                    }
+                    if ui.button("Close").clicked() {
+                        close = true;
+                    }
+                });
+            });
+        if copy {
+            ctx.copy_text(report);
+        }
+        if close {
+            self.diagnostics_report = None;
+        }
+    }
+
     /// macOS: reset actions. "Restore all item swaps" uses the existing
     /// swapper manifest; "Restore all game files" runs the comprehensive
     /// uninstall/restore pass. Both are confirmation-gated.
@@ -5158,6 +5449,20 @@ impl HebnixApp {
         });
         ui.label(
             egui::RichText::new("Only enable if the game is open but Hebnix still says it is not detected. Turn it off when done.")
+                .size(11.0)
+                .color(egui::Color32::GRAY),
+        );
+
+        ui.separator();
+        ui.label("Diagnostics");
+        if ui
+            .button("Copy diagnostics (patch folder, game process, files)")
+            .clicked()
+        {
+            self.diagnostics_report = Some(self.collect_diagnostics());
+        }
+        ui.label(
+            egui::RichText::new("Use this when Hebnix detects the game but patches do not show up in Rocket League.")
                 .size(11.0)
                 .color(egui::Color32::GRAY),
         );
@@ -8298,6 +8603,8 @@ impl eframe::App for HebnixApp {
         if !self.hidden {
             #[cfg(target_os = "macos")]
             self.render_github_update_popup(ctx);
+            #[cfg(target_os = "macos")]
+            self.render_diagnostics(ctx);
             self.render_item_clear_prompt(ctx);
             self.render_admin_prompt(ctx);
             self.render_item_action_prompt(ctx);
