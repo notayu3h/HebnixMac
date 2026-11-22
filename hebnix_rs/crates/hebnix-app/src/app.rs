@@ -755,7 +755,7 @@ pub struct HebnixApp {
     #[cfg(target_os = "macos")]
     restore_game_status: Option<String>,
     #[cfg(target_os = "macos")]
-    diagnostics_report: Option<String>,
+    diagnostics_status: Option<String>,
     chat_export: crate::patcher::chat_export::State,
     lan_commands: crate::patcher::lan_commands::State,
     chat_paste: crate::patcher::chat_paste::State,
@@ -1404,7 +1404,7 @@ impl HebnixApp {
             #[cfg(target_os = "macos")]
             restore_game_status: None,
             #[cfg(target_os = "macos")]
-            diagnostics_report: None,
+            diagnostics_status: None,
             chat_export: Default::default(),
             lan_commands: Default::default(),
             chat_paste: Default::default(),
@@ -5400,46 +5400,6 @@ impl HebnixApp {
         Self::redact_diagnostics(&out)
     }
 
-    #[cfg(target_os = "macos")]
-    fn render_diagnostics(&mut self, ctx: &egui::Context) {
-        let Some(report) = self.diagnostics_report.clone() else {
-            return;
-        };
-        let mut close = false;
-        let mut copy = false;
-        egui::Window::new("Hebnix Mac diagnostics")
-            .id(egui::Id::new("hebnix-mac-diagnostics"))
-            .collapsible(false)
-            .resizable(true)
-            .default_size([580.0, 460.0])
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(ctx, |ui| {
-                ui.label(
-                    "Saved to the redacted text log below. Home paths, account names, emails and IPs are removed.",
-                );
-                ui.add_space(4.0);
-                let mut text = report.as_str();
-                ui.add_sized(
-                    [560.0, 360.0],
-                    egui::TextEdit::multiline(&mut text).font(egui::TextStyle::Monospace),
-                );
-                ui.horizontal(|ui| {
-                    if ui.button("Copy to clipboard").clicked() {
-                        copy = true;
-                    }
-                    if ui.button("Close").clicked() {
-                        close = true;
-                    }
-                });
-            });
-        if copy {
-            ctx.copy_text(report);
-        }
-        if close {
-            self.diagnostics_report = None;
-        }
-    }
-
     /// macOS: reset actions. "Restore all item swaps" uses the existing
     /// swapper manifest; "Restore all game files" runs the comprehensive
     /// uninstall/restore pass. Both are confirmation-gated.
@@ -5543,19 +5503,40 @@ impl HebnixApp {
 
         ui.separator();
         ui.label("Diagnostics");
-        if ui.button("Save redacted diagnostics log").clicked() {
-            let report = self.collect_diagnostics();
-            let saved = match Self::save_diagnostics_log(&report) {
-                Ok(path) => format!(
-                    "Saved to: {}\n",
-                    Self::redact_diagnostics(&path.to_string_lossy())
-                ),
-                Err(error) => format!("Could not save log: {error}\n"),
-            };
-            self.diagnostics_report = Some(format!("{saved}\n{report}"));
+        ui.horizontal(|ui| {
+            if ui.button("Save redacted diagnostics log").clicked() {
+                let report = self.collect_diagnostics();
+                self.diagnostics_status = Some(match Self::save_diagnostics_log(&report) {
+                    Ok(path) => format!(
+                        "Saved to {}",
+                        Self::redact_diagnostics(&path.to_string_lossy())
+                    ),
+                    Err(error) => format!("Could not save log: {error}"),
+                });
+            }
+            if ui.button("Reveal log in Finder").clicked() {
+                let path = self.base_dir.join("hebnix-mac-diagnostics.txt");
+                match std::process::Command::new("open")
+                    .arg("-R")
+                    .arg(&path)
+                    .spawn()
+                {
+                    Ok(_) => self.diagnostics_status = Some(format!(
+                        "Opened Finder at {}",
+                        Self::redact_diagnostics(&path.to_string_lossy())
+                    )),
+                    Err(error) => {
+                        self.diagnostics_status = Some(format!("Could not open Finder: {error}"))
+                    }
+                }
+            }
+        });
+        if let Some(status) = &self.diagnostics_status {
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new(status).size(11.0).color(egui::Color32::GRAY));
         }
         ui.label(
-            egui::RichText::new("Writes hebnix-mac-diagnostics.txt to the Hebnix support folder. Use it when the game is detected but patches do not show up. Home paths, account names, emails and IPs are removed.")
+            egui::RichText::new("Writes hebnix-mac-diagnostics.txt to the Hebnix support folder. Home paths, account names, emails and IPs are removed. Use this when the game is detected but patches do not show up, or when FPS drops after a change.")
                 .size(11.0)
                 .color(egui::Color32::GRAY),
         );
@@ -8696,8 +8677,6 @@ impl eframe::App for HebnixApp {
         if !self.hidden {
             #[cfg(target_os = "macos")]
             self.render_github_update_popup(ctx);
-            #[cfg(target_os = "macos")]
-            self.render_diagnostics(ctx);
             self.render_item_clear_prompt(ctx);
             self.render_admin_prompt(ctx);
             self.render_item_action_prompt(ctx);
