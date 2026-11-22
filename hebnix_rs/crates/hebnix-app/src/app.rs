@@ -5065,6 +5065,94 @@ impl HebnixApp {
         self.render_hebnix_settings(ui);
     }
 
+    /// Strip things that identify the machine or its owner before a report
+    /// leaves it: home dir, account name, email addresses and IP addresses.
+    /// Paths keep their structure (`~/Library/...`) so they stay diagnostic.
+    #[cfg(target_os = "macos")]
+    fn redact_diagnostics(text: &str) -> String {
+        fn redact_emails(input: &str) -> String {
+            let mut out = String::with_capacity(input.len());
+            let mut token = String::new();
+            for ch in input.chars().chain(std::iter::once('\n')) {
+                if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-' | '+' | '@') {
+                    token.push(ch);
+                    continue;
+                }
+                if token.matches('@').count() == 1 {
+                    out.push_str("<email>");
+                } else {
+                    out.push_str(&token);
+                }
+                token.clear();
+                out.push(ch);
+            }
+            out
+        }
+
+        fn redact_ips(input: &str) -> String {
+            let chars: Vec<char> = input.chars().collect();
+            let mut out = String::with_capacity(input.len());
+            let mut i = 0;
+            while i < chars.len() {
+                if chars[i].is_ascii_digit() {
+                    let start = i;
+                    while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '.') {
+                        i += 1;
+                    }
+                    let candidate: String = chars[start..i].iter().collect();
+                    let parts: Vec<&str> = candidate.split('.').collect();
+                    if parts.len() == 4
+                        && parts.iter().all(|p| {
+                            !p.is_empty()
+                                && p.len() <= 3
+                                && p.chars().all(|c| c.is_ascii_digit())
+                        })
+                    {
+                        out.push_str("<ip>");
+                    } else {
+                        out.push_str(&candidate);
+                    }
+                } else {
+                    out.push(chars[i]);
+                    i += 1;
+                }
+            }
+            out
+        }
+
+        let mut out = text.to_string();
+        if let Some(home) = std::env::var_os("HOME") {
+            out = out.replace(&std::path::PathBuf::from(home).to_string_lossy().to_string(), "~");
+        }
+        let user = std::env::var("USER").unwrap_or_default();
+        if !user.is_empty() {
+            out = out.replace(&format!("/Users/{user}"), "/Users/<user>");
+            out = out.replace(&format!("\\Users\\{user}"), "\\Users\\<user>");
+            if user.len() >= 4 {
+                out = out.replace(&user, "<user>");
+            }
+        }
+        redact_ips(&redact_emails(&out))
+    }
+
+    /// Append the redacted snapshot to a plain text log next to Hebnix's own
+    /// state, so it can be attached to a bug report without a screenshot.
+    #[cfg(target_os = "macos")]
+    fn save_diagnostics_log(report: &str) -> Result<std::path::PathBuf, String> {
+        use std::io::Write as _;
+        let path = crate::config::base_dir().join("hebnix-mac-diagnostics.txt");
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        writeln!(file, "\n===== hebnix diagnostics =====")
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        file.write_all(report.as_bytes())
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        Ok(path)
+    }
+
     /// Snapshot of everything that decides where macOS patches go. Detection
     /// being green says nothing about the folder the patcher actually writes
     /// to, so one report carries both sides plus the files on disk.
@@ -5309,7 +5397,7 @@ impl HebnixApp {
         if shown == 0 {
             let _ = writeln!(out, "  (none)");
         }
-        out
+        Self::redact_diagnostics(&out)
     }
 
     #[cfg(target_os = "macos")]
@@ -5327,7 +5415,7 @@ impl HebnixApp {
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
                 ui.label(
-                    "Paste this into a bug report. It shows the folder patches are written to, the game process, and recent file changes.",
+                    "Saved to the redacted text log below. Home paths, account names, emails and IPs are removed.",
                 );
                 ui.add_space(4.0);
                 let mut text = report.as_str();
@@ -5455,14 +5543,19 @@ impl HebnixApp {
 
         ui.separator();
         ui.label("Diagnostics");
-        if ui
-            .button("Copy diagnostics (patch folder, game process, files)")
-            .clicked()
-        {
-            self.diagnostics_report = Some(self.collect_diagnostics());
+        if ui.button("Save redacted diagnostics log").clicked() {
+            let report = self.collect_diagnostics();
+            let saved = match Self::save_diagnostics_log(&report) {
+                Ok(path) => format!(
+                    "Saved to: {}\n",
+                    Self::redact_diagnostics(&path.to_string_lossy())
+                ),
+                Err(error) => format!("Could not save log: {error}\n"),
+            };
+            self.diagnostics_report = Some(format!("{saved}\n{report}"));
         }
         ui.label(
-            egui::RichText::new("Use this when Hebnix detects the game but patches do not show up in Rocket League.")
+            egui::RichText::new("Writes hebnix-mac-diagnostics.txt to the Hebnix support folder. Use it when the game is detected but patches do not show up. Home paths, account names, emails and IPs are removed.")
                 .size(11.0)
                 .color(egui::Color32::GRAY),
         );
@@ -9636,5 +9729,30 @@ impl HebnixApp {
                 self.render_current_page(ui);
             }
         });
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod diagnostics_tests {
+    use super::HebnixApp;
+
+    #[test]
+    fn redacts_personal_info_but_keeps_diagnostic_paths() {
+        let user = std::env::var("USER").unwrap_or_else(|_| "someone".into());
+        let home = std::env::var("HOME").unwrap_or_else(|_| format!("/Users/{user}"));
+        let input = format!(
+            "{home}/Library/Application Support/com.zagrios.obelisk \
+             /Users/{user}/Documents owner@example.com 192.168.1.20 \
+             TAGame/CookedPCConsole/Binaries"
+        );
+        let redacted = HebnixApp::redact_diagnostics(&input);
+        assert!(!redacted.contains(&home));
+        assert!(!redacted.contains(&user));
+        assert!(!redacted.contains("owner@example.com"));
+        assert!(!redacted.contains("192.168.1.20"));
+        assert!(redacted.contains("<email>"));
+        assert!(redacted.contains("<ip>"));
+        assert!(redacted.contains("~/Library/Application Support/com.zagrios.obelisk"));
+        assert!(redacted.contains("TAGame/CookedPCConsole/Binaries"));
     }
 }
