@@ -5536,7 +5536,7 @@ impl HebnixApp {
             ui.label(egui::RichText::new(status).size(11.0).color(egui::Color32::GRAY));
         }
         ui.label(
-            egui::RichText::new("Writes hebnix-mac-diagnostics.txt to the Hebnix support folder. Home paths, account names, emails and IPs are removed. Use this when the game is detected but patches do not show up, or when FPS drops after a change.")
+            egui::RichText::new("Writes hebnix-mac-diagnostics.txt to the Hebnix support folder. Home paths, account names, emails and IPs are removed.")
                 .size(11.0)
                 .color(egui::Color32::GRAY),
         );
